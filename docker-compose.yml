@@ -1,0 +1,146 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: hermes_redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - hermes_net
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  orchestrator:
+    build:
+      context: ./services/orchestrator
+      dockerfile: Dockerfile
+    container_name: hermes_orchestrator
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./services/orchestrator/src:/app/src
+      - ./services/orchestrator/src:/app/src
+    networks:
+      - hermes_net
+    healthcheck:
+      test: ["CMD", "python", "/app/src/healthcheck.py"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  workers:
+    build:
+      context: ./services/workers
+      dockerfile: Dockerfile
+    container_name: hermes_workers
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./services/orchestrator/src:/app/src
+      - ./services/orchestrator/src:/app/src
+    networks:
+      - hermes_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  guardian:
+    build:
+      context: ./services/guardian
+      dockerfile: Dockerfile
+    container_name: hermes_guardian
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./services/orchestrator/src:/app/src
+      - ./services/orchestrator/src:/app/src
+      - backup_vault:/app/backups
+    networks:
+      - hermes_net
+    healthcheck:
+      test: ["CMD", "python", "/app/src/healthcheck.py"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backup_vault:
+    build:
+      context: ./services/backup_vault
+      dockerfile: Dockerfile
+    container_name: hermes_backup_vault
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./services/orchestrator/src:/app/src
+      - ./services/orchestrator/src:/app/src
+      - backup_vault:/app/backups
+    networks:
+      - hermes_net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  redis_data:
+  backup_vault:
+
+networks:
+  hermes_net:
+    driver: bridge
