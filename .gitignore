@@ -1,12 +1,14 @@
+# Konfigurasi rahasia dan kredensial (JANGAN DI-PUSH)
 .env
-data/
+
+# Database SQLite lokal dan data runtime
 *.db
-*.log
+data/
+backups/
+
+# Cache Python
 __pycache__/
 *.pyc
-.env
-data/
-*.db
-*.log
-__pycache__/
-*.pyc
+*.pyo
+*.pyd
+.pytest_cache/

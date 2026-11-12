@@ -2,33 +2,24 @@ services:
   redis:
     image: redis:7-alpine
     container_name: hermes_redis
-    restart: unless-stopped
-    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "6379:6379"
     volumes:
       - redis_data:/data
-    networks:
-      - hermes_net
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 5
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
   orchestrator:
-    build:
-      context: ./services/orchestrator
-      dockerfile: Dockerfile
+    build: .
     container_name: hermes_orchestrator
-    environment:
-      - PYTHONUNBUFFERED=1
-    restart: unless-stopped
+    restart: always
+    working_dir: /app/services/orchestrator
+    command: ["python", "-u", "src/main.py"]
     depends_on:
       redis:
         condition: service_healthy
@@ -36,57 +27,27 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      - ./services/orchestrator/src:/app/src
-      - ./services/orchestrator/src:/app/src
-    networks:
-      - hermes_net
-    healthcheck:
-      test: ["CMD", "python", "/app/src/healthcheck.py"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
   workers:
-    build:
-      context: ./services/workers
-      dockerfile: Dockerfile
+    build: .
     container_name: hermes_workers
-    environment:
-      - PYTHONUNBUFFERED=1
-    restart: unless-stopped
+    restart: always
+    working_dir: /app/services/workers
+    command: ["python", "-u", "src/main.py"]
     depends_on:
       redis:
         condition: service_healthy
-      orchestrator:
-        condition: service_started
     env_file:
       - .env
     volumes:
       - ./data:/app/data
-      - ./services/orchestrator/src:/app/src
-      - ./services/orchestrator/src:/app/src
-    networks:
-      - hermes_net
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
   guardian:
-    build:
-      context: ./services/guardian
-      dockerfile: Dockerfile
+    build: .
     container_name: hermes_guardian
-    environment:
-      - PYTHONUNBUFFERED=1
     restart: always
+    working_dir: /app/services/guardian
+    command: ["python", "-u", "src/main.py"]
     depends_on:
       redis:
         condition: service_healthy
@@ -94,31 +55,14 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      - ./services/orchestrator/src:/app/src
-      - ./services/orchestrator/src:/app/src
-      - backup_vault:/app/backups
-    networks:
-      - hermes_net
-    healthcheck:
-      test: ["CMD", "python", "/app/src/healthcheck.py"]
-      interval: 20s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - ./backups:/app/backups
 
   backup_vault:
-    build:
-      context: ./services/backup_vault
-      dockerfile: Dockerfile
+    build: .
     container_name: hermes_backup_vault
-    environment:
-      - PYTHONUNBUFFERED=1
-    restart: unless-stopped
+    restart: always
+    working_dir: /app/services/backup_vault
+    command: ["python", "-u", "backup_daemon.py"]
     depends_on:
       redis:
         condition: service_healthy
@@ -126,21 +70,7 @@ services:
       - .env
     volumes:
       - ./data:/app/data
-      - ./services/orchestrator/src:/app/src
-      - ./services/orchestrator/src:/app/src
-      - backup_vault:/app/backups
-    networks:
-      - hermes_net
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - ./backups:/app/backups
 
 volumes:
   redis_data:
-  backup_vault:
-
-networks:
-  hermes_net:
-    driver: bridge

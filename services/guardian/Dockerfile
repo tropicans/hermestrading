@@ -7,10 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 1000 hermes_user
 WORKDIR /app
 
+# Salin requirements dari root proyek
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/ ./src/
+# Salin kode sumber servis guardian
+COPY services/guardian/src/ ./src/
 RUN chown -R hermes_user:hermes_user /app
 
 USER hermes_user

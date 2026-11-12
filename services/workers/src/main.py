@@ -1,6 +1,5 @@
 import os
 import sys
-import time
 import json
 import threading
 import redis
@@ -39,10 +38,9 @@ def listen_emergency_events():
                 print("[workers] ✅ RESUME RECEIVED: Siaga memproses order.")
 
 def evaluate_and_respond():
-    """Worker loop untuk membaca antrean proposal order dari Orchestrator"""
+    """Worker loop untuk memvalidasi antrean proposal order dari Orchestrator"""
     print("[workers] Worker Queue Processor aktif mendengarkan 'hermes:trade_queue'...")
     while True:
-        # Blocking pop dengan timeout 2 detik
         item = r.blpop("hermes:trade_queue", timeout=2)
         if not item:
             continue
@@ -72,11 +70,11 @@ def evaluate_and_respond():
             guard.validate_trade(trade_payload)
             res = {"status": "APPROVED", "trade_id": trade_id}
             r.publish(resp_channel, json.dumps(res))
-            print(f"[workers] Trade #{trade_id} [{trade_payload['pair']}] VERIFIKASI LOLOS (Syariah Compliant).")
+            print(f"[workers] Trade #{trade_id} [{trade_payload.get('pair')}] VERIFIKASI LOLOS (Syariah Compliant).")
         except SyariahComplianceError as err:
             res = {"status": "REJECTED", "reason": str(err)}
             r.publish(resp_channel, json.dumps(res))
-            print(f"[workers] Trade #{trade_id} [{trade_payload['pair']}] DITOLAK SYARIAH: {err}")
+            print(f"[workers] Trade #{trade_id} [{trade_payload.get('pair')}] DITOLAK SYARIAH: {err}")
 
 if __name__ == "__main__":
     t_event = threading.Thread(target=listen_emergency_events, daemon=True)

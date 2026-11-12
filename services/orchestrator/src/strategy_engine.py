@@ -1,23 +1,37 @@
 # -*- coding: utf-8 -*-
-import urllib.request
-import json
+import os
 import random
+import ccxt
 
 class MarketDataFeed:
-    @staticmethod
-    def get_spot_price(pair: str = "PAXGUSD") -> float:
-        """Mengambil harga pasar spot PAXG/USD riil langsung dari Kraken Public Ticker."""
-        url = "https://api.kraken.com/0/public/Ticker?pair=PAXGUSD"
+    _exchange = None
+
+    @classmethod
+    def _get_public_exchange(cls):
+        if cls._exchange is None:
+            exchange_id = os.getenv("EXCHANGE_ID", "indodax").lower()
+            exchange_class = getattr(ccxt, exchange_id, ccxt.indodax)
+            cls._exchange = exchange_class({'enableRateLimit': True})
+        return cls._exchange
+
+    @classmethod
+    def get_spot_price(cls, pair: str = None) -> float:
+        """Mengambil harga pasar spot riil langsung dari Public Ticker Exchange (Indodax/CCXT)."""
+        target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
         try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Hermes-Feed/1.0'})
-            with urllib.request.urlopen(req, timeout=5) as response:
-                data = json.loads(response.read().decode())
-                if not data.get("error"):
-                    ticker = data["result"].get("PAXGUSD", {})
-                    return float(ticker["c"][0])
-        except Exception:
-            pass
+            ex = cls._get_public_exchange()
+            ticker = ex.fetch_ticker(target_pair)
+            last_price = ticker.get("last") or ticker.get("close")
+            if last_price and float(last_price) > 0:
+                return float(last_price)
+        except Exception as e:
+            print(f"[strategy_engine] Gagal mengambil ticker {target_pair}: {e}")
+
+        # Fallback aman sesuai mata uang jika koneksi internet/API sempat terputus
+        if "IDR" in target_pair.upper():
+            return round(44000000.0 * (1.0 + random.uniform(-0.0003, 0.0003)), 0)
         return round(2685.0 + random.uniform(-0.6, 0.6), 2)
+
 
 class EMAMomentumStrategy:
     def __init__(self, fast_period: int = 3, slow_period: int = 5, rsi_period: int = 14, atr_period: int = 14):
@@ -31,11 +45,11 @@ class EMAMomentumStrategy:
 
     def add_price(self, price: float):
         self.prices.append(price)
-        # Estimasi high/low mikro per iterasi tick
-        self.highs.append(round(price + 0.15, 2))
-        self.lows.append(round(price - 0.15, 2))
+        # Estimasi high/low mikro proporsional (0.006% dari harga, cocok untuk IDR maupun USD)
+        spread = max(0.01, price * 0.00006)
+        self.highs.append(round(price + spread, 2))
+        self.lows.append(round(price - spread, 2))
 
-        # Batasi memori array historis
         if len(self.prices) > 60:
             self.prices.pop(0)
             self.highs.pop(0)
@@ -52,7 +66,7 @@ class EMAMomentumStrategy:
 
     def calculate_rsi(self) -> float:
         if len(self.prices) <= self.rsi_period:
-            return 50.0  # Netral jika data belum mencukupi
+            return 50.0
 
         gains = []
         losses = []
@@ -65,7 +79,6 @@ class EMAMomentumStrategy:
                 gains.append(0.0)
                 losses.append(abs(change))
 
-        # Ambil sampel sejumlah periode
         recent_gains = gains[-self.rsi_period:]
         recent_losses = losses[-self.rsi_period:]
 
@@ -78,8 +91,10 @@ class EMAMomentumStrategy:
         return 100.0 - (100.0 / (1.0 + rs))
 
     def calculate_atr(self) -> float:
+        current_p = self.prices[-1] if self.prices else 2685.0
+        min_atr = current_p * 0.0006  # Minimal 0.06% dari harga aset
         if len(self.prices) <= self.atr_period:
-            return 2.50  # Default $2.50 volatilitas normal emas PAXG
+            return round(current_p * 0.001, 2)
 
         tr_list = []
         for i in range(1, len(self.prices)):
@@ -90,12 +105,11 @@ class EMAMomentumStrategy:
             tr_list.append(tr)
 
         recent_tr = tr_list[-self.atr_period:]
-        return max(1.5, sum(recent_tr) / len(recent_tr))
+        return max(min_atr, sum(recent_tr) / len(recent_tr))
 
     def analyze(self, pair: str, current_price: float) -> dict:
         self.add_price(current_price)
         
-        # Butuh minimal sampel harga untuk kalkulasi akurat
         if len(self.prices) < self.rsi_period + 2:
             return None
 
@@ -104,16 +118,16 @@ class EMAMomentumStrategy:
         rsi = self.calculate_rsi()
         atr = self.calculate_atr()
 
-        # 1. Konfirmasi Crossover: EMA Fast menembus EMA Slow dari bawah
         ema_cross = (ema_fast > ema_slow) and (self.prices[-2] <= ema_slow)
-
-        # 2. Filter RSI: Pastikan ada momentum sehat dan belum overbought (42 <= RSI <= 68)
         rsi_valid = 42.0 <= rsi <= 68.0
 
         if ema_cross and rsi_valid:
-            # 3. Dynamic Volatility TP/SL berbasis ATR (Menutup Fee Kraken ~0.26% x 2)
-            tp_distance = round(atr * 1.8, 2)
-            sl_distance = round(atr * 1.2, 2)
+            # Pastikan jarak TP menutup biaya transaksi exchange lokal (~0.3% - 0.5%)
+            min_tp_dist = current_price * 0.006
+            min_sl_dist = current_price * 0.004
+
+            tp_distance = round(max(atr * 1.8, min_tp_dist), 2)
+            sl_distance = round(max(atr * 1.2, min_sl_dist), 2)
 
             tp_price = round(current_price + tp_distance, 2)
             sl_price = round(current_price - sl_distance, 2)

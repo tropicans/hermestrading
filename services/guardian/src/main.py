@@ -11,6 +11,14 @@ from telebot import apihelper, types
 import redis
 from chart_generator import generate_paxg_chart
 
+# Tambahkan path src orchestrator agar guardian bisa memanggil broker_gateway jika diperlukan
+sys.path.insert(0, '/app/services/orchestrator/src')
+try:
+    from broker_gateway import get_broker_client
+    _global_broker = get_broker_client()
+except Exception:
+    _global_broker = None
+
 EMOJI_SHIELD = "\U0001F6E1\uFE0F"
 EMOJI_CHART = "\U0001F4CA"
 EMOJI_UP_GRAPH = "\U0001F4C8"
@@ -40,8 +48,21 @@ ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+TRADING_SYMBOL = os.getenv("TRADING_SYMBOL", "PAXG/IDR").upper()
+EXCHANGE_ID = os.getenv("EXCHANGE_ID", "indodax").upper()
+IS_IDR = "IDR" in TRADING_SYMBOL
+
 DB_PATH = "/app/data/trading.db"
 BACKUP_DIR = "/app/backups"
+
+def fmt_curr(val) -> str:
+    try:
+        v = float(val or 0.0)
+    except Exception:
+        v = 0.0
+    if IS_IDR:
+        return f"Rp {v:,.0f}"
+    return f"${v:,.2f}"
 
 if not BOT_TOKEN or "ISI_" in BOT_TOKEN:
     print("[guardian] PERINGATAN: TELEGRAM_BOT_TOKEN belum disetel.")
@@ -108,11 +129,20 @@ def generate_performance_report(date_str="now"):
             WHERE DATE(created_at) = DATE(?)
         """, (date_str,))
         row = c.fetchone()
-
-        c.execute("SELECT remaining_balance FROM orders ORDER BY id DESC LIMIT 1")
-        bal_row = c.fetchone()
-        latest_balance = bal_row[0] if bal_row else 10000.0
         conn.close()
+
+        # Ambil sisa saldo langsung dari broker live/paper terkini
+        latest_balance = 0.0
+        if _global_broker:
+            try:
+                acc_bal = _global_broker.get_account_balance(TRADING_SYMBOL)
+                latest_balance = float(acc_bal.get("cash_balance", 0.0))
+            except Exception:
+                pass
+
+        if latest_balance <= 0:
+            default_bal = 150000000.0 if IS_IDR else 10000.0
+            latest_balance = float(os.getenv("PAPER_INITIAL_BALANCE", default_bal))
 
         total_orders, total_buys, open_pos, closed_pos, win_count, loss_count, realized_pnl, total_turnover = row
         total_orders = total_orders or 0
@@ -126,17 +156,19 @@ def generate_performance_report(date_str="now"):
         pnl_prefix = "+" if realized_pnl >= 0 else "-"
         pnl_badge = EMOJI_GREEN_CIRCLE if realized_pnl >= 0 else EMOJI_RED_CIRCLE
 
+        mode_label = os.getenv("TRADING_MODE", "PAPER").upper()
         return (
-            f"{EMOJI_UP_GRAPH} <b>HERMES PERFORMANCE RECAP</b>\n"
+            f"{EMOJI_UP_GRAPH} <b>HERMES PERFORMANCE RECAP ({mode_label})</b>\n"
             f"{EMOJI_CALENDAR} Tanggal: <code>{datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d UTC')}</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
+            f"• Exchange: <code>{EXCHANGE_ID} ({TRADING_SYMBOL})</code>\n"
             f"• Total Order: <code>{total_orders}</code>\n"
             f"• Posisi Terbuka: <code>{open_pos}</code>\n"
             f"• Posisi Selesai: <code>{closed_pos}</code>\n"
             f"• Win Rate: <code>{win_rate:.1f}%</code> ({win_count}W / {loss_count}L)\n"
-            f"• Perputaran Kas: <code>${total_turnover:,.2f}</code>\n"
-            f"• Realized PnL: {pnl_badge} <code>{pnl_prefix}${abs(realized_pnl):,.2f}</code>\n"
-            f"• Sisa Saldo: <code>${latest_balance:,.2f}</code>\n"
+            f"• Perputaran Kas: <code>{fmt_curr(total_turnover)}</code>\n"
+            f"• Realized PnL: {pnl_badge} <code>{pnl_prefix}{fmt_curr(abs(realized_pnl))}</code>\n"
+            f"• Sisa Saldo: <code>{fmt_curr(latest_balance)}</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"Status Syariah: <code>STRICT (Spot 1:1, Zero-Swap)</code>"
         )
@@ -145,12 +177,14 @@ def generate_performance_report(date_str="now"):
 
 def show_status(chat_id):
     is_killed = r.get("hermes:kill_switch") == "active"
-    state_str = f"{EMOJI_RED_CIRCLE} HALTED (Kill-Switch Active)" if is_killed else f"{EMOJI_GREEN_CIRCLE} RUNNING (Operational)"
+    mode_label = os.getenv("TRADING_MODE", "PAPER").upper()
+    state_str = f"{EMOJI_RED_CIRCLE} HALTED (Kill-Switch Active)" if is_killed else f"{EMOJI_GREEN_CIRCLE} RUNNING ({mode_label})"
     status_text = (
         f"{EMOJI_CHART} <b>HERMES SYSTEM STATUS</b>\n"
         f"• Status Trading: <code>{state_str}</code>\n"
+        f"• Exchange: <code>{EXCHANGE_ID}</code>\n"
+        f"• Pair Utama: <code>{TRADING_SYMBOL}</code>\n"
         f"• Kepatuhan Syariah: <code>{EMOJI_CHECK} STRICT (Spot 1:1, Zero-Swap)</code>\n"
-        f"• Pair Utama: <code>PAXG/USD</code>\n"
         f"• Max Leverage: <code>1.0x (Spot Physical)</code>\n"
     )
     inline_kb = types.InlineKeyboardMarkup()
@@ -168,7 +202,7 @@ def send_chart_image(chat_id):
         bot.send_photo(
             chat_id,
             chart_buf,
-            caption=f"{EMOJI_CHART} <b>PAXG/USD Technical Overview</b>\n• Strategi: EMA 3 / EMA 5 Momentum\n• Mode: Spot 1:1",
+            caption=f"{EMOJI_CHART} <b>{TRADING_SYMBOL} Technical Overview ({EXCHANGE_ID})</b>\n• Strategi: EMA 3 / EMA 5 Momentum\n• Mode: Spot 1:1",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -191,8 +225,9 @@ def execute_kill(chat_id):
 def send_welcome(message):
     if not is_admin(message):
         return
+    mode_label = os.getenv("TRADING_MODE", "PAPER").upper()
     text = (
-        f"{EMOJI_SHIELD} <b>HERMES CONTROL PANEL</b>\n\n"
+        f"{EMOJI_SHIELD} <b>HERMES CONTROL PANEL ({EXCHANGE_ID} - {mode_label})</b>\n\n"
         f"Gunakan menu tombol navigasi di bawah layar:"
     )
     inline_kb = types.InlineKeyboardMarkup(row_width=2)
@@ -265,8 +300,8 @@ def handle_positions(message):
             resp += (
                 f"• Tiket: <code>{ticket}</code>\n"
                 f"  Pair: <code>{r_item[1]}</code> | Vol: <code>{r_item[2]}</code>\n"
-                f"  Entry: <code>${r_item[3]}</code>\n"
-                f"  TP: <code>${r_item[4]}</code> | SL: <code>${r_item[5]}</code>\n"
+                f"  Entry: <code>{fmt_curr(r_item[3])}</code>\n"
+                f"  TP: <code>{fmt_curr(r_item[4])}</code> | SL: <code>{fmt_curr(r_item[5])}</code>\n"
                 f"  Waktu: <code>{r_item[6]}</code>\n\n"
             )
             inline_kb.add(types.InlineKeyboardButton(f"{EMOJI_RED_CIRCLE} Tutup {ticket}", callback_data=f"close_{ticket}"))
@@ -311,7 +346,7 @@ def handle_inline_clicks(call):
     if data.startswith("close_"):
         ticket = data.replace("close_", "")
         bot.answer_callback_query(call.id, f"Menutup order {ticket}...")
-        r.publish("hermes:manual_close", json.dumps({"ticket": ticket, "pair": "PAXGUSD"}))
+        r.publish("hermes:manual_close", json.dumps({"ticket": ticket, "pair": TRADING_SYMBOL}))
         bot.send_message(chat_id, f"{EMOJI_LIGHTNING} Perintah penutupan dikirim untuk: <code>{ticket}</code>", parse_mode="HTML")
     elif data == "btn_status":
         bot.answer_callback_query(call.id)
@@ -382,7 +417,7 @@ def listen_trade_alerts():
             try:
                 alert = json.loads(msg["data"])
                 event_type = alert.get("type")
-                pair = alert.get("pair", "-")
+                pair = alert.get("pair", TRADING_SYMBOL)
                 
                 if event_type == "CIRCUIT_BREAKER_TRIGGERED":
                     text = (
@@ -398,9 +433,9 @@ def listen_trade_alerts():
                     text = (
                         f"{EMOJI_UP_GRAPH} <b>TRAILING STOP LOSS ADJUSTED</b>\n"
                         f"• Tiket: <code>{alert.get('ticket')}</code>\n"
-                        f"• Entry: <code>${alert.get('entry')}</code>\n"
-                        f"• Level Tertinggi: <code>${alert.get('highest')}</code>\n"
-                        f"• Stop Loss Baru: <code>${alert.get('new_sl')}</code> ({EMOJI_CHECK} Profit Terkunci)\n"
+                        f"• Entry: <code>{fmt_curr(alert.get('entry'))}</code>\n"
+                        f"• Level Tertinggi: <code>{fmt_curr(alert.get('highest'))}</code>\n"
+                        f"• Stop Loss Baru: <code>{fmt_curr(alert.get('new_sl'))}</code> ({EMOJI_CHECK} Profit Terkunci)\n"
                     )
                     safe_send_alert(text)
                 elif event_type == "ORDER_EXECUTED":
@@ -410,27 +445,27 @@ def listen_trade_alerts():
                         f"• Tiket: <code>{ticket}</code>\n"
                         f"• Pasangan: <code>{pair}</code> (Spot 1:1)\n"
                         f"• Aksi: <code>{alert.get('action')}</code> | Vol: <code>{alert.get('volume')}</code>\n"
-                        f"• Harga Fill: <code>${alert.get('fill_price')}</code>\n"
-                        f"• Total Nilai: <code>${alert.get('total_cost', 0):,}</code>\n"
-                        f"• Target TP: <code>${alert.get('tp')}</code>\n"
-                        f"• Target SL: <code>${alert.get('sl')}`\n"
-                        f"• Sisa Kas Tunai: <code>${alert.get('balance'):,}</code>\n"
+                        f"• Harga Fill: <code>{fmt_curr(alert.get('fill_price'))}</code>\n"
+                        f"• Total Nilai: <code>{fmt_curr(alert.get('total_cost', 0))}</code>\n"
+                        f"• Target TP: <code>{fmt_curr(alert.get('tp'))}</code>\n"
+                        f"• Target SL: <code>{fmt_curr(alert.get('sl'))}</code>\n"
+                        f"• Sisa Kas Tunai: <code>{fmt_curr(alert.get('balance'))}</code>\n"
                     )
                     inline_kb = types.InlineKeyboardMarkup()
                     inline_kb.add(types.InlineKeyboardButton(f"{EMOJI_RED_CIRCLE} Tutup {ticket}", callback_data=f"close_{ticket}"))
                     inline_kb.add(types.InlineKeyboardButton(f"{EMOJI_CHART} Lihat Chart", callback_data="btn_send_chart"))
                     bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML", reply_markup=inline_kb)
                 elif event_type == "POSITION_CLOSED":
-                    pnl = alert.get("pnl", 0.0)
+                    pnl = float(alert.get("pnl", 0.0))
                     emoji_badge = EMOJI_MONEY_BAG if pnl >= 0 else EMOJI_OCTAGON
                     text = (
                         f"{emoji_badge} <b>POSISI DITUTUP ({alert.get('reason')})</b>\n"
                         f"• Tiket: <code>{alert.get('ticket')}</code>\n"
                         f"• Pasangan: <code>{pair}</code>\n"
-                        f"• Entry: <code>${alert.get('entry_price')}</code>\n"
-                        f"• Exit: <code>${alert.get('close_price')}</code>\n"
-                        f"• PnL: <code>${pnl}</code>\n"
-                        f"• Saldo Kas Akhir: <code>${alert.get('balance'):,}</code>\n"
+                        f"• Entry: <code>{fmt_curr(alert.get('entry_price'))}</code>\n"
+                        f"• Exit: <code>{fmt_curr(alert.get('close_price'))}</code>\n"
+                        f"• PnL: <code>{fmt_curr(pnl)}</code>\n"
+                        f"• Saldo Kas Akhir: <code>{fmt_curr(alert.get('balance'))}</code>\n"
                     )
                     safe_send_alert(text)
             except Exception as err:
@@ -454,7 +489,7 @@ if __name__ == "__main__":
     t_summary = threading.Thread(target=midnight_summary_scheduler, daemon=True)
     t_summary.start()
     
-    print("[guardian] Telegram Guardian Bot dengan Visual Chart Engine aktif.")
+    print(f"[guardian] Telegram Guardian Bot ({EXCHANGE_ID} - {TRADING_SYMBOL}) dengan Visual Chart Engine aktif.")
     
     while True:
         try:

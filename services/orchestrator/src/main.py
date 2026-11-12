@@ -17,15 +17,19 @@ REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 
-MAX_CAPITAL_RISK_PER_TRADE = 0.05
-DAILY_MAX_DRAWDOWN = -150.0
-MAX_CONCURRENT_POSITIONS = 3
+TRADING_SYMBOL = os.getenv("TRADING_SYMBOL", "PAXG/IDR").upper()
+IS_IDR_PAIR = "IDR" in TRADING_SYMBOL
 
-# Rasio Trailing disesuaikan agar lebih fleksibel terhadap ayunan emas
-BREAKEVEN_THRESHOLD_PCT = 0.0012  # Profit +0.12% sebelum trailing aktif
+MAX_CAPITAL_RISK_PER_TRADE = float(os.getenv("MAX_CAPITAL_RISK_PER_TRADE", "0.05"))
+# Default batas rugi harian: Rp 2.500.000 untuk pair IDR, atau $150 untuk pair USD
+DEFAULT_DRAWDOWN = "-2500000.0" if IS_IDR_PAIR else "-150.0"
+DAILY_MAX_DRAWDOWN = float(os.getenv("DAILY_MAX_DRAWDOWN", DEFAULT_DRAWDOWN))
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
+
+BREAKEVEN_THRESHOLD_PCT = 0.0012
 TRAILING_DISTANCE_PCT = 0.0008
 
-last_known_price = 2685.0
+last_known_price = 44000000.0 if IS_IDR_PAIR else 2685.0
 
 try:
     r = redis.Redis(
@@ -47,24 +51,24 @@ strategy = EMAMomentumStrategy(fast_period=3, slow_period=5, rsi_period=14, atr_
 def check_risk_circuit_breaker() -> bool:
     today_pnl = get_today_realized_pnl()
     if today_pnl <= DAILY_MAX_DRAWDOWN:
-        print(f"[orchestrator] CIRCUIT BREAKER! Rugi harian (${today_pnl}) menyentuh limit.")
+        print(f"[orchestrator] CIRCUIT BREAKER! Rugi harian ({today_pnl:,.2f}) menyentuh limit.")
         r.set("hermes:kill_switch", "active")
         alert_payload = {
             "type": "CIRCUIT_BREAKER_TRIGGERED",
-            "reason": f"Akumulasi rugi harian menyentuh batas: ${today_pnl:,.2f}"
+            "reason": f"Akumulasi rugi harian menyentuh batas: {today_pnl:,.2f}"
         }
         r.publish("hermes:alerts", json.dumps(alert_payload))
         return False
     return True
 
 def calculate_dynamic_volume(price: float) -> float:
-    acc = broker.get_account_balance()
+    acc = broker.get_account_balance(TRADING_SYMBOL)
     available_cash = acc.get("cash_balance", 0.0)
     allocated_cash = available_cash * MAX_CAPITAL_RISK_PER_TRADE
     if price <= 0:
-        return 0.01
+        return 0.001
     raw_volume = allocated_cash / price
-    return max(0.01, round(raw_volume, 4))
+    return max(0.001, round(raw_volume, 6))
 
 def close_single_position(pos: dict, current_price: float, reason: str = "MANUAL_CLOSE"):
     global broker
@@ -73,7 +77,7 @@ def close_single_position(pos: dict, current_price: float, reason: str = "MANUAL
     vol = float(pos["volume"])
     pair = pos["pair"]
 
-    res = broker.close_spot_position(ticket, vol, buy_p, current_price)
+    res = broker.close_spot_position(ticket, vol, buy_p, current_price, pair=pair)
     close_position_db(ticket, current_price, res["pnl"], res["remaining_balance"])
     
     alert_payload = {
@@ -88,7 +92,7 @@ def close_single_position(pos: dict, current_price: float, reason: str = "MANUAL
     }
     r.publish("hermes:alerts", json.dumps(alert_payload))
     check_risk_circuit_breaker()
-    print(f"[orchestrator] Posisi {ticket} ditutup ({reason}) @ ${current_price} | PnL: ${res['pnl']}")
+    print(f"[orchestrator] Posisi {ticket} ditutup ({reason}) @ {current_price:,.2f} | PnL: {res['pnl']:,.2f}")
 
 def listen_manual_close_events():
     sub_r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
@@ -129,7 +133,6 @@ def process_trailing_and_exits(pair: str, current_price: float):
         new_high = max(highest_p, current_price)
         gain_from_entry = (new_high - buy_p) / buy_p
 
-        # Trailing Stop hanya merayap naik jika profit sudah melewati ambang breakeven
         if gain_from_entry >= BREAKEVEN_THRESHOLD_PCT:
             proposed_sl = round(new_high * (1.0 - TRAILING_DISTANCE_PCT), 2)
             if proposed_sl > sl:
@@ -183,7 +186,7 @@ def dispatch_trade_proposal(proposal: dict):
             res = json.loads(message["data"])
             if res.get("status") == "APPROVED":
                 try:
-                    fill_p = proposal.get("trigger_price", 2685.0)
+                    fill_p = proposal.get("trigger_price", last_known_price)
                     take_profit = proposal.get("take_profit")
                     stop_loss = proposal.get("stop_loss")
 
@@ -211,7 +214,7 @@ def dispatch_trade_proposal(proposal: dict):
                     record_audit(trade_id, proposal["pair"], "APPROVED", "Syariah Compliant (Spot 1:1)")
 
                     meta_info = proposal.get("meta", {})
-                    print(f"[orchestrator] FILLED: #{exec_res['ticket']} @ ${fill_p} | TP: ${take_profit} | SL: ${stop_loss} | RSI: {meta_info.get('rsi')} | ATR: ${meta_info.get('atr')}")
+                    print(f"[orchestrator] FILLED: #{exec_res['ticket']} @ {fill_p:,.2f} | TP: {take_profit:,.2f} | SL: {stop_loss:,.2f} | RSI: {meta_info.get('rsi')} | ATR: {meta_info.get('atr')}")
 
                     alert_payload = {
                         "type": "ORDER_EXECUTED",
@@ -244,21 +247,20 @@ def dispatch_trade_proposal(proposal: dict):
 
 def start_automated_loop():
     global last_known_price
-    pair = "PAXGUSD"
+    pair = TRADING_SYMBOL
     print(f"[orchestrator] Strategy Engine (EMA+RSI+ATR Guard) Aktif pada pair: {pair}...")
 
     t_manual = threading.Thread(target=listen_manual_close_events, daemon=True)
     t_manual.start()
 
-    # Pemanasan data feed awal (15 tick)
-    print("[orchestrator] Mengumpulkan data harga awal untuk inisialisasi indikator...")
+    print(f"[orchestrator] Mengumpulkan data harga awal {pair} dari {os.getenv('EXCHANGE_ID', 'indodax').upper()}...")
     for _ in range(15):
         price = MarketDataFeed.get_spot_price(pair)
         strategy.add_price(price)
         last_known_price = price
         time.sleep(1)
 
-    print("[orchestrator] Monitoring pasar aktif.")
+    print(f"[orchestrator] Monitoring pasar aktif. Harga terkini {pair}: {last_known_price:,.2f}")
 
     while True:
         try:
@@ -273,7 +275,7 @@ def start_automated_loop():
                     dynamic_vol = calculate_dynamic_volume(current_price)
                     proposal["volume"] = dynamic_vol
                     dispatch_trade_proposal(proposal)
-                    time.sleep(15)  # Cooldown pasca entri
+                    time.sleep(15)
         except Exception as e:
             print(f"[orchestrator] Error loop: {e}")
             

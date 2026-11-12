@@ -1,0 +1,10 @@
+requests
+redis
+python-dotenv
+pandas
+numpy
+websockets
+pyTelegramBotAPI
+pyTelegramBotAPI
+matplotlib
+ccxt
