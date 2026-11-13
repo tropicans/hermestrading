@@ -11,7 +11,6 @@ from telebot import apihelper, types
 import redis
 from chart_generator import generate_paxg_chart
 
-# Tambahkan path src orchestrator agar guardian bisa memanggil broker_gateway jika diperlukan
 sys.path.insert(0, '/app/services/orchestrator/src')
 try:
     from broker_gateway import get_broker_client
@@ -100,12 +99,14 @@ def get_main_reply_keyboard():
     btn_status = types.KeyboardButton(f"{EMOJI_CHART} Status Sistem")
     btn_summary = types.KeyboardButton(f"{EMOJI_UP_GRAPH} Rekap PnL")
     btn_positions = types.KeyboardButton(f"{EMOJI_CLIPBOARD} Posisi Aktif")
+    btn_logs = types.KeyboardButton(f"{EMOJI_SCROLL} Log & Indikator")
     btn_chart = types.KeyboardButton(f"{EMOJI_CHART} Lihat Chart")
     btn_backup = types.KeyboardButton(f"{EMOJI_DISK} Menu Backup")
     btn_kill = types.KeyboardButton(f"{EMOJI_SIREN} Emergency Kill")
     markup.add(btn_status, btn_summary)
-    markup.add(btn_positions, btn_chart)
-    markup.add(btn_backup, btn_kill)
+    markup.add(btn_positions, btn_logs)
+    markup.add(btn_chart, btn_backup)
+    markup.add(btn_kill)
     return markup
 
 def generate_performance_report(date_str="now"):
@@ -131,16 +132,17 @@ def generate_performance_report(date_str="now"):
         row = c.fetchone()
         conn.close()
 
-        # Ambil sisa saldo langsung dari broker live/paper terkini
         latest_balance = 0.0
+        asset_balance = 0.0
         if _global_broker:
             try:
                 acc_bal = _global_broker.get_account_balance(TRADING_SYMBOL)
                 latest_balance = float(acc_bal.get("cash_balance", 0.0))
+                asset_balance = float(acc_bal.get("asset_balance", 0.0))
             except Exception:
                 pass
 
-        if latest_balance <= 0:
+        if latest_balance <= 0 and os.getenv("TRADING_MODE", "PAPER").upper() != "LIVE":
             default_bal = 150000000.0 if IS_IDR else 10000.0
             latest_balance = float(os.getenv("PAPER_INITIAL_BALANCE", default_bal))
 
@@ -168,31 +170,99 @@ def generate_performance_report(date_str="now"):
             f"• Win Rate: <code>{win_rate:.1f}%</code> ({win_count}W / {loss_count}L)\n"
             f"• Perputaran Kas: <code>{fmt_curr(total_turnover)}</code>\n"
             f"• Realized PnL: {pnl_badge} <code>{pnl_prefix}{fmt_curr(abs(realized_pnl))}</code>\n"
-            f"• Sisa Saldo: <code>{fmt_curr(latest_balance)}</code>\n"
+            f"• Saldo Kas IDR: <code>{fmt_curr(latest_balance)}</code>\n"
+            f"• Saldo Aset PAXG: <code>{asset_balance:.6f} PAXG</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"Status Syariah: <code>STRICT (Spot 1:1, Zero-Swap)</code>"
         )
     except Exception as e:
         return f"{EMOJI_OCTAGON} Gagal kalkulasi database: {e}"
 
+def build_logs_and_telemetry_text():
+    raw_tel = r.get("hermes:telemetry")
+    tel_block = "<i>Belum ada data telemetri.</i>\n"
+    if raw_tel:
+        try:
+            t = json.loads(raw_tel)
+            ema_diff = float(t.get("ema_fast", 0)) - float(t.get("ema_slow", 0))
+            trend_str = "BULLISH (EMA3 > EMA5)" if ema_diff > 0 else "WAIT / CONSOLIDATION (EMA3 <= EMA5)"
+            tel_block = (
+                f"• Harga Terkini: <code>{fmt_curr(t.get('price'))}</code>\n"
+                f"• EMA Cepat (3): <code>{fmt_curr(t.get('ema_fast'))}</code>\n"
+                f"• EMA Lambat (5): <code>{fmt_curr(t.get('ema_slow'))}</code>\n"
+                f"• Status EMA: <code>{trend_str}</code>\n"
+                f"• RSI (14): <code>{t.get('rsi')}</code> (Target Buy: 42 - 68)\n"
+                f"• ATR (14): <code>{fmt_curr(t.get('atr'))}</code>\n"
+                f"• Update Terakhir: <code>{t.get('updated_at')}</code>\n"
+            )
+        except Exception:
+            pass
+
+    logs = r.lrange("hermes:logs", 0, 11)
+    if logs:
+        # Balik urutan agar yang paling baru berada di bawah
+        log_lines = "\n".join([l.replace("<", "&lt;").replace(">", "&gt;") for l in reversed(logs)])
+    else:
+        log_lines = "Belum ada catatan log di Redis."
+
+    return (
+        f"{EMOJI_SCROLL} <b>LIVE TELEMETRY &amp; SYSTEM LOGS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{tel_block}"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<b>12 Aktivitas Terakhir Orchestrator:</b>\n"
+        f"<pre>{log_lines}</pre>"
+    )
+
+def show_logs(chat_id, message_id=None):
+    text = build_logs_and_telemetry_text()
+    inline_kb = types.InlineKeyboardMarkup(row_width=2)
+    inline_kb.add(
+        types.InlineKeyboardButton(f"{EMOJI_REFRESH} Refresh Log", callback_data="btn_logs"),
+        types.InlineKeyboardButton(f"{EMOJI_CHART} Lihat Chart", callback_data="btn_send_chart")
+    )
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, parse_mode="HTML", reply_markup=inline_kb)
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=inline_kb)
+
 def show_status(chat_id):
     is_killed = r.get("hermes:kill_switch") == "active"
     mode_label = os.getenv("TRADING_MODE", "PAPER").upper()
     state_str = f"{EMOJI_RED_CIRCLE} HALTED (Kill-Switch Active)" if is_killed else f"{EMOJI_GREEN_CIRCLE} RUNNING ({mode_label})"
+    
+    raw_tel = r.get("hermes:telemetry")
+    last_update_str = "-"
+    last_price_str = "-"
+    if raw_tel:
+        try:
+            t = json.loads(raw_tel)
+            last_update_str = t.get("updated_at", "-")
+            last_price_str = fmt_curr(t.get("price", 0))
+        except Exception:
+            pass
+
     status_text = (
         f"{EMOJI_CHART} <b>HERMES SYSTEM STATUS</b>\n"
         f"• Status Trading: <code>{state_str}</code>\n"
         f"• Exchange: <code>{EXCHANGE_ID}</code>\n"
         f"• Pair Utama: <code>{TRADING_SYMBOL}</code>\n"
+        f"• Harga Pantauan: <code>{last_price_str}</code>\n"
+        f"• Detak Terakhir: <code>{last_update_str}</code>\n"
         f"• Kepatuhan Syariah: <code>{EMOJI_CHECK} STRICT (Spot 1:1, Zero-Swap)</code>\n"
-        f"• Max Leverage: <code>1.0x (Spot Physical)</code>\n"
     )
-    inline_kb = types.InlineKeyboardMarkup()
+    inline_kb = types.InlineKeyboardMarkup(row_width=2)
     if is_killed:
         inline_kb.add(types.InlineKeyboardButton(f"{EMOJI_PLAY} Resume Trading", callback_data="btn_resume"))
     else:
         inline_kb.add(types.InlineKeyboardButton(f"{EMOJI_OCTAGON} Matikan Trading (Kill)", callback_data="btn_kill"))
-    inline_kb.add(types.InlineKeyboardButton(f"{EMOJI_CHART} Buka Chart Snapshot", callback_data="btn_send_chart"))
+    inline_kb.add(
+        types.InlineKeyboardButton(f"{EMOJI_SCROLL} Cek Log & Indikator", callback_data="btn_logs"),
+        types.InlineKeyboardButton(f"{EMOJI_CHART} Chart Snapshot", callback_data="btn_send_chart")
+    )
     bot.send_message(chat_id, status_text, parse_mode="HTML", reply_markup=inline_kb)
 
 def send_chart_image(chat_id):
@@ -233,14 +303,20 @@ def send_welcome(message):
     inline_kb = types.InlineKeyboardMarkup(row_width=2)
     inline_kb.add(
         types.InlineKeyboardButton(f"{EMOJI_CHART} Status", callback_data="btn_status"),
+        types.InlineKeyboardButton(f"{EMOJI_SCROLL} Log & Indikator", callback_data="btn_logs"),
         types.InlineKeyboardButton(f"{EMOJI_UP_GRAPH} Rekap PnL", callback_data="btn_summary"),
         types.InlineKeyboardButton(f"{EMOJI_CLIPBOARD} Posisi", callback_data="btn_positions"),
         types.InlineKeyboardButton(f"{EMOJI_CHART} Chart", callback_data="btn_send_chart"),
-        types.InlineKeyboardButton(f"{EMOJI_DISK} Backup", callback_data="btn_backup"),
         types.InlineKeyboardButton(f"{EMOJI_PACKAGE} Unduh DB", callback_data="btn_download_live")
     )
     bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=get_main_reply_keyboard())
     bot.send_message(message.chat.id, f"{EMOJI_BULB} <b>Menu Cepat Interaktif:</b>", parse_mode="HTML", reply_markup=inline_kb)
+
+@bot.message_handler(func=lambda msg: msg.text in [f"{EMOJI_SCROLL} Log & Indikator", "📜 Log & Indikator", "/logs", "/log"])
+def handle_logs_msg(message):
+    if not is_admin(message):
+        return
+    show_logs(message.chat.id)
 
 @bot.message_handler(func=lambda msg: msg.text in [f"{EMOJI_CHART} Lihat Chart", "📊 Lihat Chart", "/chart"])
 def handle_chart_msg(message):
@@ -351,6 +427,9 @@ def handle_inline_clicks(call):
     elif data == "btn_status":
         bot.answer_callback_query(call.id)
         show_status(chat_id)
+    elif data == "btn_logs":
+        bot.answer_callback_query(call.id, "Memuat telemetri & log...")
+        show_logs(chat_id, call.message.message_id)
     elif data == "btn_send_chart":
         bot.answer_callback_query(call.id, "Merender grafik...")
         send_chart_image(chat_id)
@@ -429,6 +508,23 @@ def listen_trade_alerts():
                     inline_kb = types.InlineKeyboardMarkup()
                     inline_kb.add(types.InlineKeyboardButton(f"{EMOJI_PLAY} Resume Trading", callback_data="btn_resume"))
                     bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML", reply_markup=inline_kb)
+                elif event_type == "SYSTEM_ERROR":
+                    err_msg = str(alert.get("message", "")).replace("<", "&lt;").replace(">", "&gt;")
+                    text = (
+                        f"{EMOJI_WARNING} <b>SYSTEM / BROKER ALERT ({alert.get('level', 'ERROR')})</b>\n"
+                        f"• Waktu: <code>{alert.get('timestamp', '-')}</code>\n"
+                        f"• Detail: <code>{err_msg}</code>\n"
+                    )
+                    inline_kb = types.InlineKeyboardMarkup()
+                    inline_kb.add(types.InlineKeyboardButton(f"{EMOJI_SCROLL} Lihat Log Lengkap", callback_data="btn_logs"))
+                    bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML", reply_markup=inline_kb)
+                elif event_type == "TRADE_REJECTED":
+                    text = (
+                        f"{EMOJI_OCTAGON} <b>SINYAL DITOLAK WORKER GUARD</b>\n"
+                        f"• Pair: <code>{pair}</code>\n"
+                        f"• Alasan: <code>{alert.get('reason')}</code>"
+                    )
+                    safe_send_alert(text)
                 elif event_type == "TRAILING_SL_UPDATED":
                     text = (
                         f"{EMOJI_UP_GRAPH} <b>TRAILING STOP LOSS ADJUSTED</b>\n"
@@ -489,7 +585,7 @@ if __name__ == "__main__":
     t_summary = threading.Thread(target=midnight_summary_scheduler, daemon=True)
     t_summary.start()
     
-    print(f"[guardian] Telegram Guardian Bot ({EXCHANGE_ID} - {TRADING_SYMBOL}) dengan Visual Chart Engine aktif.")
+    print(f"[guardian] Telegram Guardian Bot ({EXCHANGE_ID} - {TRADING_SYMBOL}) dengan Visual Chart & Log Telemetry aktif.")
     
     while True:
         try:
