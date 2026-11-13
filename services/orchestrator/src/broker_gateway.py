@@ -23,7 +23,6 @@ class CCXTSpotBroker:
         self._patch_indodax_markets()
 
     def _patch_indodax_markets(self):
-        """Memastikan market ID Indodax di CCXT menggunakan ticker_id (dengan underscore, misal paxg_idr)."""
         if self.exchange_id == "indodax":
             try:
                 markets = self.client.load_markets()
@@ -46,7 +45,6 @@ class CCXTSpotBroker:
         return pair[:-3].upper(), pair[-3:].upper()
 
     def get_account_balance(self, pair: str = None) -> dict:
-        """Mengambil saldo kas tunai (IDR/USDT) dan saldo aset (PAXG) dari dompet exchange."""
         target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
         base_curr, quote_curr = self._split_pair(target_pair)
         try:
@@ -63,7 +61,6 @@ class CCXTSpotBroker:
             return {"cash_balance": 0.0, "asset_balance": 0.0}
 
     def execute_spot_order(self, pair: str, action: str, volume: float, price: float) -> dict:
-        """Eksekusi order spot fisik 1:1 tanpa leverage."""
         base_curr, quote_curr = self._split_pair(pair)
         symbol = f"{base_curr}/{quote_curr}"
         side = action.lower()
@@ -71,9 +68,9 @@ class CCXTSpotBroker:
         try:
             if self.exchange_id == "indodax":
                 self._patch_indodax_markets()
-                exec_price = int(round(price)) if quote_curr == "IDR" else price
+                # Beri sedikit buffer +0.1% pada limit buy agar langsung match instan sebagai taker
+                exec_price = int(round(price * 1.001)) if (quote_curr == "IDR" and side == "buy") else (int(round(price)) if quote_curr == "IDR" else price)
                 exec_vol = round(volume, 8)
-                # Indodax TAPI mewajibkan limit order atau parameter pair ber-underscore (paxg_idr)
                 order = self.client.create_order(symbol, "limit", side, exec_vol, exec_price)
             else:
                 order = self.client.create_order(symbol, "market", side, volume, price)
@@ -95,20 +92,24 @@ class CCXTSpotBroker:
             raise BrokerExecutionError(f"Gagal eksekusi live order di {self.exchange_id}: {e}")
 
     def close_spot_position(self, ticket: str, volume: float, entry_price: float, current_price: float, pair: str = None) -> dict:
-        """Eksekusi penjualan spot fisik untuk merealisasikan PnL."""
         target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
         base_curr, quote_curr = self._split_pair(target_pair)
         symbol = f"{base_curr}/{quote_curr}"
         try:
+            acc_before = self.get_account_balance(symbol)
+            avail_asset = acc_before.get("asset_balance", 0.0)
+            # Gunakan volume yang tersedia di dompet jika terpotong fee beli 0.2% Indodax
+            sell_vol = min(volume, avail_asset) if avail_asset > 0 else volume
+            sell_vol = round(sell_vol, 8)
+
             if self.exchange_id == "indodax":
                 self._patch_indodax_markets()
                 exec_price = int(round(current_price * 0.998)) if quote_curr == "IDR" else current_price
-                exec_vol = round(volume, 8)
-                self.client.create_order(symbol, "limit", "sell", exec_vol, exec_price)
+                self.client.create_order(symbol, "limit", "sell", sell_vol, exec_price)
             else:
-                self.client.create_order(symbol, "market", "sell", volume)
+                self.client.create_order(symbol, "market", "sell", sell_vol)
 
-            pnl = round((current_price - entry_price) * volume, 2)
+            pnl = round((current_price - entry_price) * sell_vol, 2)
             acc = self.get_account_balance(symbol)
             return {
                 "ticket": ticket,
@@ -120,7 +121,6 @@ class CCXTSpotBroker:
 
 
 class PaperSpotBroker:
-    """Simulator internal untuk paper trading aman tanpa menyentuh saldo riil."""
     def __init__(self, initial_balance: float = None):
         pair = os.getenv("TRADING_SYMBOL", "PAXG/IDR").upper()
         if initial_balance is None:

@@ -206,7 +206,7 @@ def build_logs_and_telemetry_text():
         log_lines = "Belum ada catatan log di Redis."
 
     return (
-        f"{EMOJI_SCROLL} <b>LIVE TELEMETRY &amp; SYSTEM LOGS</b>\n"
+        f"{EMOJI_SCROLL} <b>LIVE TELEMETRY &amp; SYSTEM LOGS</b> (<code>{datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=7))).strftime('%H:%M:%S')}</code>)\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{tel_block}"
         f"━━━━━━━━━━━━━━━━━━\n"

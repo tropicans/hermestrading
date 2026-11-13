@@ -4,6 +4,7 @@ import sys
 import time
 import json
 import uuid
+import datetime
 import threading
 import redis
 from broker_gateway import get_broker_client, BrokerExecutionError
@@ -21,7 +22,6 @@ TRADING_SYMBOL = os.getenv("TRADING_SYMBOL", "PAXG/IDR").upper()
 IS_IDR_PAIR = "IDR" in TRADING_SYMBOL
 
 MAX_CAPITAL_RISK_PER_TRADE = float(os.getenv("MAX_CAPITAL_RISK_PER_TRADE", "0.05"))
-# Default batas rugi harian: Rp 2.500.000 untuk pair IDR, atau $150 untuk pair USD
 DEFAULT_DRAWDOWN = "-2500000.0" if IS_IDR_PAIR else "-150.0"
 DAILY_MAX_DRAWDOWN = float(os.getenv("DAILY_MAX_DRAWDOWN", DEFAULT_DRAWDOWN))
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
@@ -29,7 +29,8 @@ MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 BREAKEVEN_THRESHOLD_PCT = 0.0012
 TRAILING_DISTANCE_PCT = 0.0008
 
-last_known_price = 44000000.0 if IS_IDR_PAIR else 2685.0
+last_known_price = 72000000.0 if IS_IDR_PAIR else 2685.0
+_last_error_alert_ts = 0.0
 
 try:
     r = redis.Redis(
@@ -44,6 +45,28 @@ except Exception as e:
     print(f"[orchestrator] Gagal terkoneksi ke Redis: {e}")
     sys.exit(1)
 
+def sys_log(msg: str, level: str = "INFO", notify_telegram: bool = False):
+    global _last_error_alert_ts
+    now_wib = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=7)).strftime("%H:%M:%S")
+    formatted = f"[{now_wib}] [{level}] {msg}"
+    print(f"[orchestrator] {formatted}", flush=True)
+    try:
+        r.lpush("hermes:logs", formatted)
+        r.ltrim("hermes:logs", 0, 49)
+        if notify_telegram:
+            now_ts = time.time()
+            if level != "ERROR" or (now_ts - _last_error_alert_ts > 60):
+                if level == "ERROR":
+                    _last_error_alert_ts = now_ts
+                r.publish("hermes:alerts", json.dumps({
+                    "type": "SYSTEM_ERROR",
+                    "level": level,
+                    "message": msg,
+                    "timestamp": f"{now_wib} WIB"
+                }))
+    except Exception:
+        pass
+
 init_db()
 broker = get_broker_client()
 strategy = EMAMomentumStrategy(fast_period=3, slow_period=5, rsi_period=14, atr_period=14)
@@ -51,7 +74,7 @@ strategy = EMAMomentumStrategy(fast_period=3, slow_period=5, rsi_period=14, atr_
 def check_risk_circuit_breaker() -> bool:
     today_pnl = get_today_realized_pnl()
     if today_pnl <= DAILY_MAX_DRAWDOWN:
-        print(f"[orchestrator] CIRCUIT BREAKER! Rugi harian ({today_pnl:,.2f}) menyentuh limit.")
+        sys_log(f"CIRCUIT BREAKER! Rugi harian ({today_pnl:,.2f}) menyentuh limit.", "WARN")
         r.set("hermes:kill_switch", "active")
         alert_payload = {
             "type": "CIRCUIT_BREAKER_TRIGGERED",
@@ -65,10 +88,12 @@ def calculate_dynamic_volume(price: float) -> float:
     acc = broker.get_account_balance(TRADING_SYMBOL)
     available_cash = acc.get("cash_balance", 0.0)
     allocated_cash = available_cash * MAX_CAPITAL_RISK_PER_TRADE
+    if IS_IDR_PAIR and available_cash >= 15000.0:
+        allocated_cash = max(allocated_cash, min(available_cash * 0.95, 15000.0))
     if price <= 0:
-        return 0.001
+        return 0.0002
     raw_volume = allocated_cash / price
-    return max(0.001, round(raw_volume, 6))
+    return max(0.00015, round(raw_volume, 8))
 
 def close_single_position(pos: dict, current_price: float, reason: str = "MANUAL_CLOSE"):
     global broker
@@ -77,28 +102,30 @@ def close_single_position(pos: dict, current_price: float, reason: str = "MANUAL
     vol = float(pos["volume"])
     pair = pos["pair"]
 
-    res = broker.close_spot_position(ticket, vol, buy_p, current_price, pair=pair)
-    close_position_db(ticket, current_price, res["pnl"], res["remaining_balance"])
-    
-    alert_payload = {
-        "type": "POSITION_CLOSED",
-        "ticket": ticket,
-        "pair": pair,
-        "reason": reason,
-        "entry_price": buy_p,
-        "close_price": current_price,
-        "pnl": res["pnl"],
-        "balance": res["remaining_balance"]
-    }
-    r.publish("hermes:alerts", json.dumps(alert_payload))
-    check_risk_circuit_breaker()
-    print(f"[orchestrator] Posisi {ticket} ditutup ({reason}) @ {current_price:,.2f} | PnL: {res['pnl']:,.2f}")
+    try:
+        res = broker.close_spot_position(ticket, vol, buy_p, current_price, pair=pair)
+        close_position_db(ticket, current_price, res["pnl"], res["remaining_balance"])
+        
+        alert_payload = {
+            "type": "POSITION_CLOSED",
+            "ticket": ticket,
+            "pair": pair,
+            "reason": reason,
+            "entry_price": buy_p,
+            "close_price": current_price,
+            "pnl": res["pnl"],
+            "balance": res["remaining_balance"]
+        }
+        r.publish("hermes:alerts", json.dumps(alert_payload))
+        check_risk_circuit_breaker()
+        sys_log(f"Posisi {ticket} ditutup ({reason}) @ {current_price:,.0f} | PnL: {res['pnl']:,.0f}")
+    except Exception as e:
+        sys_log(f"Gagal menutup posisi {ticket}: {e}", "ERROR", notify_telegram=True)
 
 def listen_manual_close_events():
     sub_r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD, decode_responses=True)
     pubsub = sub_r.pubsub()
     pubsub.subscribe("hermes:manual_close")
-
     for msg in pubsub.listen():
         if msg["type"] == "message":
             try:
@@ -116,7 +143,7 @@ def listen_manual_close_events():
                             close_single_position(p, curr_p, "MANUAL_CLOSE")
                             break
             except Exception as e:
-                print(f"[orchestrator] Error manual close: {e}")
+                sys_log(f"Error manual close: {e}", "ERROR", notify_telegram=True)
 
 def process_trailing_and_exits(pair: str, current_price: float):
     positions = get_open_positions()
@@ -134,7 +161,7 @@ def process_trailing_and_exits(pair: str, current_price: float):
         gain_from_entry = (new_high - buy_p) / buy_p
 
         if gain_from_entry >= BREAKEVEN_THRESHOLD_PCT:
-            proposed_sl = round(new_high * (1.0 - TRAILING_DISTANCE_PCT), 2)
+            proposed_sl = round(new_high * (1.0 - TRAILING_DISTANCE_PCT), 0 if IS_IDR_PAIR else 2)
             if proposed_sl > sl:
                 update_trailing_stop(ticket, proposed_sl, new_high)
                 r.publish("hermes:alerts", json.dumps({
@@ -144,6 +171,7 @@ def process_trailing_and_exits(pair: str, current_price: float):
                     "highest": new_high,
                     "entry": buy_p
                 }))
+                sys_log(f"Trailing SL #{ticket} naik ke {proposed_sl:,.0f}")
                 sl = proposed_sl
         elif new_high > highest_p:
             update_trailing_stop(ticket, sl, new_high)
@@ -178,6 +206,7 @@ def dispatch_trade_proposal(proposal: dict):
             break
 
     r.rpush("hermes:trade_queue", payload)
+    sys_log(f"Sinyal BUY terdeteksi @ {proposal.get('trigger_price'):,.0f} (Vol: {proposal.get('volume')}). Meminta validasi worker...")
 
     start_wait = time.time()
     while time.time() - start_wait < 5:
@@ -214,7 +243,7 @@ def dispatch_trade_proposal(proposal: dict):
                     record_audit(trade_id, proposal["pair"], "APPROVED", "Syariah Compliant (Spot 1:1)")
 
                     meta_info = proposal.get("meta", {})
-                    print(f"[orchestrator] FILLED: #{exec_res['ticket']} @ {fill_p:,.2f} | TP: {take_profit:,.2f} | SL: {stop_loss:,.2f} | RSI: {meta_info.get('rsi')} | ATR: {meta_info.get('atr')}")
+                    sys_log(f"ORDER FILLED: #{exec_res['ticket']} @ {fill_p:,.0f} | TP: {take_profit:,.0f} | SL: {stop_loss:,.0f} | RSI: {meta_info.get('rsi')}")
 
                     alert_payload = {
                         "type": "ORDER_EXECUTED",
@@ -231,10 +260,13 @@ def dispatch_trade_proposal(proposal: dict):
                     }
                     r.publish("hermes:alerts", json.dumps(alert_payload))
                 except BrokerExecutionError as b_err:
-                    print(f"[orchestrator] Gagal eksekusi broker: {b_err}")
+                    sys_log(f"Gagal eksekusi broker: {b_err}", "ERROR", notify_telegram=True)
+                except Exception as ex_err:
+                    sys_log(f"Error tak terduga saat order: {ex_err}", "ERROR", notify_telegram=True)
             else:
                 reason = res.get("reason", "Tidak diketahui")
                 record_audit(trade_id, proposal["pair"], "REJECTED", reason)
+                sys_log(f"Order ditolak Worker: {reason}", "WARN")
                 r.publish("hermes:alerts", json.dumps({
                     "type": "TRADE_REJECTED",
                     "trade_id": trade_id,
@@ -245,23 +277,49 @@ def dispatch_trade_proposal(proposal: dict):
             
     pubsub.unsubscribe(response_channel)
 
+def update_telemetry(pair: str, price: float):
+    try:
+        ema_f = strategy.calculate_ema(strategy.fast_period) if strategy.prices else price
+        ema_s = strategy.calculate_ema(strategy.slow_period) if strategy.prices else price
+        rsi_v = strategy.calculate_rsi() if strategy.prices else 50.0
+        atr_v = strategy.calculate_atr() if strategy.prices else 0.0
+        now_wib = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
+        telemetry = {
+            "pair": pair,
+            "price": price,
+            "ema_fast": round(ema_f, 0 if IS_IDR_PAIR else 2),
+            "ema_slow": round(ema_s, 0 if IS_IDR_PAIR else 2),
+            "rsi": round(rsi_v, 2),
+            "atr": round(atr_v, 0 if IS_IDR_PAIR else 2),
+            "samples": len(strategy.prices),
+            "updated_at": now_wib
+        }
+        r.set("hermes:telemetry", json.dumps(telemetry))
+    except Exception:
+        pass
+
 def start_automated_loop():
     global last_known_price
     pair = TRADING_SYMBOL
-    print(f"[orchestrator] Strategy Engine (EMA+RSI+ATR Guard) Aktif pada pair: {pair}...")
+    sys_log(f"Strategy Engine (EMA+RSI+ATR Guard) Aktif pada pair: {pair}")
 
     t_manual = threading.Thread(target=listen_manual_close_events, daemon=True)
     t_manual.start()
 
-    print(f"[orchestrator] Mengumpulkan data harga awal {pair} dari {os.getenv('EXCHANGE_ID', 'indodax').upper()}...")
-    for _ in range(15):
-        price = MarketDataFeed.get_spot_price(pair)
-        strategy.add_price(price)
-        last_known_price = price
+    sys_log(f"Mengumpulkan 15 sampel data harga awal {pair} dari {os.getenv('EXCHANGE_ID', 'indodax').upper()}...")
+    for i in range(15):
+        try:
+            price = MarketDataFeed.get_spot_price(pair)
+            strategy.add_price(price)
+            last_known_price = price
+            update_telemetry(pair, price)
+        except Exception as e:
+            sys_log(f"Gagal ambil sampel awal ke-{i+1}: {e}", "WARN")
         time.sleep(1)
 
-    print(f"[orchestrator] Monitoring pasar aktif. Harga terkini {pair}: {last_known_price:,.2f}")
+    sys_log(f"Monitoring pasar aktif! Harga terkini {pair}: Rp {last_known_price:,.0f}")
 
+    tick_counter = 0
     while True:
         try:
             current_price = MarketDataFeed.get_spot_price(pair)
@@ -271,13 +329,25 @@ def start_automated_loop():
             open_positions = get_open_positions()
             if len(open_positions) < MAX_CONCURRENT_POSITIONS:
                 proposal = strategy.analyze(pair, current_price)
+                update_telemetry(pair, current_price)
                 if proposal:
                     dynamic_vol = calculate_dynamic_volume(current_price)
                     proposal["volume"] = dynamic_vol
                     dispatch_trade_proposal(proposal)
                     time.sleep(15)
+            else:
+                strategy.add_price(current_price)
+                update_telemetry(pair, current_price)
+
+            tick_counter += 1
+            if tick_counter % 225 == 0:
+                ema_f = strategy.calculate_ema(strategy.fast_period)
+                ema_s = strategy.calculate_ema(strategy.slow_period)
+                rsi_v = strategy.calculate_rsi()
+                sys_log(f"Heartbeat OK | Harga: {current_price:,.0f} | EMA3: {ema_f:,.0f} | EMA5: {ema_s:,.0f} | RSI: {rsi_v:.1f}")
+
         except Exception as e:
-            print(f"[orchestrator] Error loop: {e}")
+            sys_log(f"Error pada loop utama: {e}", "ERROR", notify_telegram=True)
             
         time.sleep(4)
 
