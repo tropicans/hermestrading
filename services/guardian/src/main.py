@@ -179,13 +179,14 @@ def generate_performance_report(date_str="now"):
         return f"{EMOJI_OCTAGON} Gagal kalkulasi database: {e}"
 
 def build_logs_and_telemetry_text():
+    now_click = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=7)).strftime("%H:%M:%S WIB")
     raw_tel = r.get("hermes:telemetry")
     tel_block = "<i>Belum ada data telemetri.</i>\n"
     if raw_tel:
         try:
             t = json.loads(raw_tel)
             ema_diff = float(t.get("ema_fast", 0)) - float(t.get("ema_slow", 0))
-            trend_str = "BULLISH (EMA3 > EMA5)" if ema_diff > 0 else "WAIT / CONSOLIDATION (EMA3 <= EMA5)"
+            trend_str = "BULLISH (EMA3 &gt; EMA5)" if ema_diff > 0 else "WAIT / CONSOLIDATION (EMA3 &lt;= EMA5)"
             tel_block = (
                 f"• Harga Terkini: <code>{fmt_curr(t.get('price'))}</code>\n"
                 f"• EMA Cepat (3): <code>{fmt_curr(t.get('ema_fast'))}</code>\n"
@@ -210,7 +211,7 @@ def build_logs_and_telemetry_text():
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{tel_block}"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"<b>12 Aktivitas Terakhir Orchestrator:</b>\n"
+        f"<b>12 Aktivitas Terakhir</b> (Dicek: <code>{now_click}</code>):\n"
         f"<pre>{log_lines}</pre>"
     )
 
