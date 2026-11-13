@@ -15,15 +15,16 @@ class CCXTSpotBroker:
             'apiKey': api_key,
             'secret': api_secret,
             'enableRateLimit': True,
+            'timeout': 10000,
             'options': {
                 'defaultType': 'spot',
                 'createMarketBuyOrderRequiresPrice': True
             }
         })
-        self._patch_indodax_markets()
+        self._markets_patched = False
 
-    def _patch_indodax_markets(self):
-        if self.exchange_id == "indodax":
+    def _ensure_indodax_markets(self):
+        if self.exchange_id == "indodax" and not self._markets_patched:
             try:
                 markets = self.client.load_markets()
                 for sym, m in markets.items():
@@ -31,6 +32,7 @@ class CCXTSpotBroker:
                     ticker_id = info.get("ticker_id")
                     if ticker_id:
                         m["id"] = ticker_id
+                self._markets_patched = True
             except Exception as e:
                 print(f"[broker_gateway] Peringatan saat memuat market {self.exchange_id}: {e}")
 
@@ -67,8 +69,7 @@ class CCXTSpotBroker:
 
         try:
             if self.exchange_id == "indodax":
-                self._patch_indodax_markets()
-                # Beri sedikit buffer +0.1% pada limit buy agar langsung match instan sebagai taker
+                self._ensure_indodax_markets()
                 exec_price = int(round(price * 1.001)) if (quote_curr == "IDR" and side == "buy") else (int(round(price)) if quote_curr == "IDR" else price)
                 exec_vol = round(volume, 8)
                 order = self.client.create_order(symbol, "limit", side, exec_vol, exec_price)
@@ -98,12 +99,11 @@ class CCXTSpotBroker:
         try:
             acc_before = self.get_account_balance(symbol)
             avail_asset = acc_before.get("asset_balance", 0.0)
-            # Gunakan volume yang tersedia di dompet jika terpotong fee beli 0.2% Indodax
             sell_vol = min(volume, avail_asset) if avail_asset > 0 else volume
             sell_vol = round(sell_vol, 8)
 
             if self.exchange_id == "indodax":
-                self._patch_indodax_markets()
+                self._ensure_indodax_markets()
                 exec_price = int(round(current_price * 0.998)) if quote_curr == "IDR" else current_price
                 self.client.create_order(symbol, "limit", "sell", sell_vol, exec_price)
             else:
