@@ -331,10 +331,24 @@ def start_automated_loop():
                 proposal = strategy.analyze(pair, current_price)
                 update_telemetry(pair, current_price)
                 if proposal:
-                    dynamic_vol = calculate_dynamic_volume(current_price)
-                    proposal["volume"] = dynamic_vol
-                    dispatch_trade_proposal(proposal)
-                    time.sleep(15)
+                    if proposal.get("action") == "SKIPPED":
+                        meta = proposal.get("meta", {})
+                        reason_str = proposal.get("reason", "-")
+                        sys_log(f"RADAR: Crossover EMA5/13 @ {current_price:,.0f} ditahan ({reason_str})", "INFO")
+                        r.publish("hermes:alerts", json.dumps({
+                            "type": "SIGNAL_SKIPPED",
+                            "pair": pair,
+                            "price": current_price,
+                            "reason": reason_str,
+                            "rsi": meta.get("rsi"),
+                            "ema_fast": meta.get("ema_fast"),
+                            "ema_slow": meta.get("ema_slow")
+                        }))
+                    else:
+                        dynamic_vol = calculate_dynamic_volume(current_price)
+                        proposal["volume"] = dynamic_vol
+                        dispatch_trade_proposal(proposal)
+                        time.sleep(15)
             else:
                 strategy.add_price(current_price)
                 update_telemetry(pair, current_price)

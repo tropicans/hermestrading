@@ -519,6 +519,17 @@ def listen_trade_alerts():
                     inline_kb = types.InlineKeyboardMarkup()
                     inline_kb.add(types.InlineKeyboardButton(f"{EMOJI_SCROLL} Lihat Log Lengkap", callback_data="btn_logs"))
                     bot.send_message(ADMIN_CHAT_ID, text, parse_mode="HTML", reply_markup=inline_kb)
+                elif event_type == "SIGNAL_SKIPPED":
+                    text = (
+                        f"👀 <b>RADAR SINYAL: CROSSOVER DITAHAN FILTER</b>\n"
+                        f"• Pasangan: <code>{pair}</code>\n"
+                        f"• Harga Saat Ini: <code>{fmt_curr(alert.get('price'))}</code>\n"
+                        f"• EMA 5 vs 13: <code>{fmt_curr(alert.get('ema_fast'))}</code> &gt; <code>{fmt_curr(alert.get('ema_slow'))}</code>\n"
+                        f"• RSI (14): <code>{alert.get('rsi')}</code>\n"
+                        f"• Alasan Tahan: <code>{alert.get('reason')}</code>\n\n"
+                        f"<i>Bot membatalkan masuk posisi untuk menghindari beli di pucuk/koreksi.</i>"
+                    )
+                    safe_send_alert(text)
                 elif event_type == "TRADE_REJECTED":
                     text = (
                         f"{EMOJI_OCTAGON} <b>SINYAL DITOLAK WORKER GUARD</b>\n"

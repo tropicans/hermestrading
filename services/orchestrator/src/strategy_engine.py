@@ -175,6 +175,25 @@ class EMAMomentumStrategy:
         price_momentum = current_price > self.prices[-2]
         rsi_valid = 45.0 <= rsi <= 68.0
 
+        if ema_cross and not (price_momentum and rsi_valid):
+            reasons = []
+            if not rsi_valid:
+                reasons.append(f"RSI {rsi:.1f} di luar zona aman (45-68)")
+            if not price_momentum:
+                reasons.append("Harga belum konfirmasi naik dari menit lalu")
+            return {
+                "action": "SKIPPED",
+                "pair": pair,
+                "trigger_price": current_price,
+                "reason": ", ".join(reasons),
+                "meta": {
+                    "rsi": round(rsi, 2),
+                    "atr": round(atr, 2),
+                    "ema_fast": round(ema_fast, 0 if "IDR" in pair.upper() else 2),
+                    "ema_slow": round(ema_slow, 0 if "IDR" in pair.upper() else 2)
+                }
+            }
+
         if ema_cross and price_momentum and rsi_valid:
             # Jarak TP minimal 1.0% dan SL minimal 0.6% (tahan terhadap spread & fee Indodax)
             min_tp_dist = current_price * 0.010
