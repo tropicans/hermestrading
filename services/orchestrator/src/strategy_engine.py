@@ -19,6 +19,25 @@ class MarketDataFeed:
         return cls._exchange
 
     @classmethod
+    def get_recent_candles(cls, pair: str = None, limit: int = 25) -> list:
+        """Mengambil riwayat candle 1-menit (TF 1m) langsung dari chart Indodax agar RSI/EMA langsung akurat saat startup."""
+        target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
+        base, quote = target_pair.upper().split("/") if "/" in target_pair else (target_pair[:-3].upper(), target_pair[-3:].upper())
+        symbol = f"{base}{quote}"
+        now_ts = int(time.time())
+        from_ts = now_ts - (limit * 60 * 3)
+        try:
+            url = f"https://indodax.com/tradingview/history_v2?symbol={symbol}&tf=1&from={from_ts}&to={now_ts}"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+                if isinstance(data, list) and len(data) >= 5:
+                    return [float(c.get("Close", 0)) for c in data[-limit:] if float(c.get("Close", 0)) > 0]
+        except Exception as e:
+            print(f"[strategy_engine] Info history_v2 fallback: {e}")
+        return []
+
+    @classmethod
     def get_spot_price(cls, pair: str = None) -> float:
         """Mengambil Mid-Price (rata-rata Bid & Ask aktif) dari Indodax agar harga selalu hidup."""
         target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
@@ -45,22 +64,6 @@ class MarketDataFeed:
                             return cls._last_valid_price
                 except Exception:
                     continue
-
-        try:
-            ex = cls._get_public_exchange()
-            ticker = ex.fetch_ticker(target_pair)
-            buy_bid = float(ticker.get("bid") or 0)
-            sell_ask = float(ticker.get("ask") or 0)
-            last_price = float(ticker.get("last") or ticker.get("close") or 0)
-            if buy_bid > 0 and sell_ask > 0:
-                cls._last_spread_pct = (sell_ask - buy_bid) / buy_bid
-                cls._last_valid_price = round((buy_bid + sell_ask) / 2.0, 0)
-                return cls._last_valid_price
-            if last_price > 0:
-                cls._last_valid_price = last_price
-                return cls._last_valid_price
-        except Exception as e:
-            print(f"[strategy_engine] Peringatan: Gagal mengambil ticker {target_pair}: {e}")
 
         if cls._last_valid_price is not None:
             return cls._last_valid_price
@@ -109,8 +112,9 @@ class EMAMomentumStrategy:
             self.lows.pop(0)
         return True
 
-    def calculate_ema(self, period: int, price_series: list = None) -> float:
-        series = price_series if price_series is not None else self.prices
+    def calculate_ema(self, period: int, price_series: list = None, live_price: float = None) -> float:
+        base_series = price_series if price_series is not None else self.prices
+        series = (base_series[:-1] + [live_price]) if (live_price and len(base_series) > 0) else base_series
         if not series:
             return 0.0
         if len(series) < period:
@@ -121,14 +125,15 @@ class EMAMomentumStrategy:
             ema = (p * k) + (ema * (1 - k))
         return ema
 
-    def calculate_rsi(self) -> float:
-        if len(self.prices) <= self.rsi_period:
+    def calculate_rsi(self, live_price: float = None) -> float:
+        series = (self.prices[:-1] + [live_price]) if (live_price and len(self.prices) > 0) else self.prices
+        if len(series) <= self.rsi_period:
             return 50.0
 
         gains = []
         losses = []
-        for i in range(1, len(self.prices)):
-            change = self.prices[i] - self.prices[i-1]
+        for i in range(1, len(series)):
+            change = series[i] - series[i-1]
             if change > 0:
                 gains.append(change)
                 losses.append(0.0)
@@ -142,10 +147,11 @@ class EMAMomentumStrategy:
         avg_gain = sum(recent_gains) / self.rsi_period
         avg_loss = sum(recent_losses) / self.rsi_period
 
-        if avg_gain == 0 and avg_loss == 0:
-            return 50.0
-        if avg_loss == 0:
-            return 75.0
+        # Tambahkan baseline volatilitas mikro (0.01% dari harga) agar RSI tidak ekstrem 0.0 atau 100.0 saat pasar sepi
+        noise_floor = (series[-1] * 0.0001) / self.rsi_period
+        avg_gain += noise_floor
+        avg_loss += noise_floor
+
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 

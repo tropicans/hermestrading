@@ -287,9 +287,9 @@ def dispatch_trade_proposal(proposal: dict):
 
 def update_telemetry(pair: str, price: float):
     try:
-        ema_f = strategy.calculate_ema(strategy.fast_period) if strategy.prices else price
-        ema_s = strategy.calculate_ema(strategy.slow_period) if strategy.prices else price
-        rsi_v = strategy.calculate_rsi() if strategy.prices else 50.0
+        ema_f = strategy.calculate_ema(strategy.fast_period, live_price=price) if strategy.prices else price
+        ema_s = strategy.calculate_ema(strategy.slow_period, live_price=price) if strategy.prices else price
+        rsi_v = strategy.calculate_rsi(live_price=price) if strategy.prices else 50.0
         atr_v = strategy.calculate_atr() if strategy.prices else 0.0
         now_wib = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         telemetry = {
@@ -315,15 +315,24 @@ def start_automated_loop():
     t_manual.start()
 
     sys_log(f"Mengumpulkan 15 sampel data harga awal {pair} dari {os.getenv('EXCHANGE_ID', 'indodax').upper()}...")
-    for i in range(15):
-        try:
-            price = MarketDataFeed.get_spot_price(pair)
-            strategy.add_price(price, force_sample=True)
-            last_known_price = price
-            update_telemetry(pair, price)
-        except Exception as e:
-            sys_log(f"Gagal ambil sampel awal ke-{i+1}: {e}", "WARN")
-        time.sleep(1)
+    hist_candles = MarketDataFeed.get_recent_candles(pair, limit=20)
+    if len(hist_candles) >= 15:
+        for hc in hist_candles:
+            strategy.add_price(hc, force_sample=True)
+        price = MarketDataFeed.get_spot_price(pair)
+        strategy.add_price(price, force_sample=True)
+        last_known_price = price
+        update_telemetry(pair, price)
+    else:
+        for i in range(15):
+            try:
+                price = MarketDataFeed.get_spot_price(pair)
+                strategy.add_price(price, force_sample=True)
+                last_known_price = price
+                update_telemetry(pair, price)
+            except Exception as e:
+                sys_log(f"Gagal ambil sampel awal ke-{i+1}: {e}", "WARN")
+            time.sleep(1)
 
     sys_log(f"Monitoring pasar aktif! Mid-Price terkini {pair}: Rp {last_known_price:,.0f}")
 

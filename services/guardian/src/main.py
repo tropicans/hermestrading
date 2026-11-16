@@ -192,7 +192,7 @@ def build_logs_and_telemetry_text():
                 f"• EMA Cepat (5): <code>{fmt_curr(t.get('ema_fast'))}</code>\n"
                 f"• EMA Lambat (13): <code>{fmt_curr(t.get('ema_slow'))}</code>\n"
                 f"• Status EMA: <code>{trend_str}</code>\n"
-                f"• RSI (14): <code>{t.get('rsi')}</code> (Target Buy: 42 - 68)\n"
+                f"• RSI (14): <code>{t.get('rsi')}</code> (Target Buy: 45 - 68)\n"
                 f"• ATR (14): <code>{fmt_curr(t.get('atr'))}</code>\n"
                 f"• Update Terakhir: <code>{t.get('updated_at')}</code>\n"
             )
