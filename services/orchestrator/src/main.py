@@ -365,7 +365,7 @@ def start_automated_loop():
                 ema_f = strategy.calculate_ema(strategy.fast_period)
                 ema_s = strategy.calculate_ema(strategy.slow_period)
                 rsi_v = strategy.calculate_rsi()
-                sys_log(f"Heartbeat OK | Harga: {current_price:,.0f} | EMA3: {ema_f:,.0f} | EMA5: {ema_s:,.0f} | RSI: {rsi_v:.1f}")
+                sys_log(f"Heartbeat OK | Harga: {current_price:,.0f} | EMA13: {ema_f:,.0f} | EMA13: {ema_s:,.0f} | RSI: {rsi_v:.1f}")
 
         except Exception as e:
             sys_log(f"Error pada loop utama: {e}", "ERROR", notify_telegram=True)

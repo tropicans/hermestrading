@@ -33,13 +33,16 @@ class MarketDataFeed:
                     with urllib.request.urlopen(req, timeout=5) as resp:
                         data = json.loads(resp.read().decode())
                         ticker = data.get("ticker", {})
-                        last_price = ticker.get("last")
+                        last_price = float(ticker.get("last") or 0)
                         buy_bid = float(ticker.get("buy") or 0)
                         sell_ask = float(ticker.get("sell") or 0)
                         if buy_bid > 0 and sell_ask > 0:
                             cls._last_spread_pct = (sell_ask - buy_bid) / buy_bid
-                        if last_price and float(last_price) > 0:
-                            cls._last_valid_price = float(last_price)
+                            # Gunakan mid-price orderbook aktif agar indikator tidak membeku saat last trade diam
+                            cls._last_valid_price = round((buy_bid + sell_ask) / 2.0, 0)
+                            return cls._last_valid_price
+                        if last_price > 0:
+                            cls._last_valid_price = last_price
                             return cls._last_valid_price
                 except Exception:
                     continue
@@ -136,8 +139,10 @@ class EMAMomentumStrategy:
         avg_gain = sum(recent_gains) / self.rsi_period
         avg_loss = sum(recent_losses) / self.rsi_period
 
+        if avg_gain == 0 and avg_loss == 0:
+            return 50.0
         if avg_loss == 0:
-            return 100.0 if avg_gain > 0 else 50.0
+            return 75.0
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 

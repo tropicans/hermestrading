@@ -186,11 +186,11 @@ def build_logs_and_telemetry_text():
         try:
             t = json.loads(raw_tel)
             ema_diff = float(t.get("ema_fast", 0)) - float(t.get("ema_slow", 0))
-            trend_str = "BULLISH (EMA3 &gt; EMA5)" if ema_diff > 0 else "WAIT / CONSOLIDATION (EMA3 &lt;= EMA5)"
+            trend_str = "BULLISH (EMA5 &gt; EMA13)" if ema_diff > 0 else "WAIT / CONSOLIDATION (EMA5 &lt;= EMA13)"
             tel_block = (
                 f"• Harga Terkini: <code>{fmt_curr(t.get('price'))}</code>\n"
-                f"• EMA Cepat (3): <code>{fmt_curr(t.get('ema_fast'))}</code>\n"
-                f"• EMA Lambat (5): <code>{fmt_curr(t.get('ema_slow'))}</code>\n"
+                f"• EMA Cepat (5): <code>{fmt_curr(t.get('ema_fast'))}</code>\n"
+                f"• EMA Lambat (13): <code>{fmt_curr(t.get('ema_slow'))}</code>\n"
                 f"• Status EMA: <code>{trend_str}</code>\n"
                 f"• RSI (14): <code>{t.get('rsi')}</code> (Target Buy: 42 - 68)\n"
                 f"• ATR (14): <code>{fmt_curr(t.get('atr'))}</code>\n"
@@ -273,7 +273,7 @@ def send_chart_image(chat_id):
         bot.send_photo(
             chat_id,
             chart_buf,
-            caption=f"{EMOJI_CHART} <b>{TRADING_SYMBOL} Technical Overview ({EXCHANGE_ID})</b>\n• Strategi: EMA 3 / EMA 5 Momentum\n• Mode: Spot 1:1",
+            caption=f"{EMOJI_CHART} <b>{TRADING_SYMBOL} Technical Overview ({EXCHANGE_ID})</b>\n• Strategi: EMA 5 / EMA 13 Momentum\n• Mode: Spot 1:1",
             parse_mode="HTML"
         )
     except Exception as e:
