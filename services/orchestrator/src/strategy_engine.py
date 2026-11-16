@@ -172,8 +172,8 @@ class EMAMomentumStrategy:
 
         # Syarat Crossover Valid: EMA Cepat memotong ke atas EMA Lambat + Harga naik nyata (> 0.05%)
         ema_cross = (ema_fast > ema_slow) and (prev_ema_fast <= prev_ema_slow)
-        price_momentum = current_price > self.prices[-2] * 1.0005
-        rsi_valid = 48.0 <= rsi <= 65.0
+        price_momentum = current_price > self.prices[-2]
+        rsi_valid = 45.0 <= rsi <= 68.0
 
         if ema_cross and price_momentum and rsi_valid:
             # Jarak TP minimal 1.0% dan SL minimal 0.6% (tahan terhadap spread & fee Indodax)
