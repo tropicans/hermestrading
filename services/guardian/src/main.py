@@ -116,6 +116,7 @@ def generate_performance_report(date_str="now"):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
+        # Ambil rekap keseluruhan (All-Time) agar histori W/L tetap tercatat lintas hari
         c.execute("""
             SELECT 
                 COUNT(*) as total_orders,
@@ -127,8 +128,7 @@ def generate_performance_report(date_str="now"):
                 COALESCE(SUM(CASE WHEN status = 'CLOSED' THEN pnl ELSE 0 END), 0.0) as realized_pnl,
                 COALESCE(SUM(total_cost), 0.0) as total_turnover
             FROM orders
-            WHERE DATE(created_at) = DATE(?)
-        """, (date_str,))
+        """)
         row = c.fetchone()
         conn.close()
 
