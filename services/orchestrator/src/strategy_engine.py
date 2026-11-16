@@ -8,6 +8,7 @@ import ccxt
 class MarketDataFeed:
     _exchange = None
     _last_valid_price = None
+    _last_spread_pct = 0.0
 
     @classmethod
     def _get_public_exchange(cls):
@@ -33,6 +34,10 @@ class MarketDataFeed:
                         data = json.loads(resp.read().decode())
                         ticker = data.get("ticker", {})
                         last_price = ticker.get("last")
+                        buy_bid = float(ticker.get("buy") or 0)
+                        sell_ask = float(ticker.get("sell") or 0)
+                        if buy_bid > 0 and sell_ask > 0:
+                            cls._last_spread_pct = (sell_ask - buy_bid) / buy_bid
                         if last_price and float(last_price) > 0:
                             cls._last_valid_price = float(last_price)
                             return cls._last_valid_price
@@ -174,13 +179,17 @@ class EMAMomentumStrategy:
         ema_cross = (ema_fast > ema_slow) and (prev_ema_fast <= prev_ema_slow)
         price_momentum = current_price > self.prices[-2]
         rsi_valid = 45.0 <= rsi <= 68.0
+        spread_pct = MarketDataFeed._last_spread_pct
+        spread_valid = spread_pct <= 0.0035
 
-        if ema_cross and not (price_momentum and rsi_valid):
+        if ema_cross and not (price_momentum and rsi_valid and spread_valid):
             reasons = []
             if not rsi_valid:
                 reasons.append(f"RSI {rsi:.1f} di luar zona aman (45-68)")
             if not price_momentum:
                 reasons.append("Harga belum konfirmasi naik dari menit lalu")
+            if not spread_valid:
+                reasons.append(f"Spread Indodax terlalu lebar ({spread_pct*100:.2f}% > 0.35%)")
             return {
                 "action": "SKIPPED",
                 "pair": pair,
@@ -194,7 +203,7 @@ class EMAMomentumStrategy:
                 }
             }
 
-        if ema_cross and price_momentum and rsi_valid:
+        if ema_cross and price_momentum and rsi_valid and spread_valid:
             # Jarak TP minimal 1.0% dan SL minimal 0.6% (tahan terhadap spread & fee Indodax)
             min_tp_dist = current_price * 0.010
             min_sl_dist = current_price * 0.006

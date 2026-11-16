@@ -71,7 +71,10 @@ init_db()
 broker = get_broker_client()
 strategy = EMAMomentumStrategy(fast_period=5, slow_period=13, rsi_period=14, atr_period=14)
 
-def check_risk_circuit_breaker() -> bool:
+def check_risk_circuit_breaker()
+        if "STOP_LOSS" in reason and res["pnl"] < 0:
+            r.setex("hermes:sl_cooldown", 1800, "active")
+            sys_log("COOLDOWN AKTIF: Jeda beli 30 menit pasca-Stop Loss untuk menghindari whipsaw.", "WARN") -> bool:
     today_pnl = get_today_realized_pnl()
     if today_pnl <= DAILY_MAX_DRAWDOWN:
         sys_log(f"CIRCUIT BREAKER! Rugi harian ({today_pnl:,.2f}) menyentuh limit.", "WARN")
@@ -187,6 +190,10 @@ def process_trailing_and_exits(pair: str, current_price: float):
 
 def dispatch_trade_proposal(proposal: dict):
     if r.get("hermes:kill_switch") == "active":
+        return
+    ttl = r.ttl("hermes:sl_cooldown")
+    if ttl and ttl > 0:
+        sys_log(f"Sinyal BUY dilewati: Masih dalam masa Cooldown pasca-SL ({ttl // 60} menit tersisa).", "INFO")
         return
 
     if not check_risk_circuit_breaker():

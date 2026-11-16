@@ -109,7 +109,9 @@ class CCXTSpotBroker:
             else:
                 self.client.create_order(symbol, "market", "sell", sell_vol)
 
-            pnl = round((current_price - entry_price) * sell_vol, 2)
+            gross_pnl = (current_price - entry_price) * sell_vol
+            est_fee = ((entry_price * sell_vol) + (current_price * sell_vol)) * 0.0022
+            pnl = round(gross_pnl - est_fee, 2)
             acc = self.get_account_balance(symbol)
             return {
                 "ticket": ticket,
