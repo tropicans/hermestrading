@@ -192,7 +192,7 @@ class EMAMomentumStrategy:
         price_momentum = current_price > self.prices[-2]
         rsi_valid = 45.0 <= rsi <= 68.0
         spread_pct = MarketDataFeed._last_spread_pct
-        spread_valid = spread_pct <= 0.0035
+        spread_valid = spread_pct <= 0.0085
 
         if ema_cross and not (price_momentum and rsi_valid and spread_valid):
             reasons = []
@@ -201,7 +201,7 @@ class EMAMomentumStrategy:
             if not price_momentum:
                 reasons.append("Harga belum konfirmasi naik dari menit lalu")
             if not spread_valid:
-                reasons.append(f"Spread Indodax terlalu lebar ({spread_pct*100:.2f}% > 0.35%)")
+                reasons.append(f"Spread Indodax terlalu lebar ({spread_pct*100:.2f}% > 0.85%)")
             return {
                 "action": "SKIPPED",
                 "pair": pair,
