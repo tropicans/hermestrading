@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
-import random
+import time
+import urllib.request
+import json
 import ccxt
 
 class MarketDataFeed:
     _exchange = None
+    _last_valid_price = None
 
     @classmethod
     def _get_public_exchange(cls):
@@ -16,25 +19,44 @@ class MarketDataFeed:
 
     @classmethod
     def get_spot_price(cls, pair: str = None) -> float:
-        """Mengambil harga pasar spot riil langsung dari Public Ticker Exchange (Indodax/CCXT)."""
+        """Mengambil harga pasar spot riil langsung dari Indodax API dengan caching aman."""
         target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
+        exchange_id = os.getenv("EXCHANGE_ID", "indodax").lower()
+
+        if exchange_id == "indodax":
+            base, quote = target_pair.lower().split("/") if "/" in target_pair else (target_pair[:-3].lower(), target_pair[-3:].lower())
+            for pair_id in [f"{base}_{quote}", f"{base}{quote}"]:
+                try:
+                    url = f"https://indodax.com/api/ticker/{pair_id}"
+                    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        data = json.loads(resp.read().decode())
+                        ticker = data.get("ticker", {})
+                        last_price = ticker.get("last")
+                        if last_price and float(last_price) > 0:
+                            cls._last_valid_price = float(last_price)
+                            return cls._last_valid_price
+                except Exception:
+                    continue
+
         try:
             ex = cls._get_public_exchange()
             ticker = ex.fetch_ticker(target_pair)
             last_price = ticker.get("last") or ticker.get("close")
             if last_price and float(last_price) > 0:
-                return float(last_price)
+                cls._last_valid_price = float(last_price)
+                return cls._last_valid_price
         except Exception as e:
-            print(f"[strategy_engine] Gagal mengambil ticker {target_pair}: {e}")
+            print(f"[strategy_engine] Peringatan: Gagal mengambil ticker {target_pair}: {e}")
 
-        # Fallback aman sesuai mata uang jika koneksi internet/API sempat terputus
-        if "IDR" in target_pair.upper():
-            return round(44000000.0 * (1.0 + random.uniform(-0.0003, 0.0003)), 0)
-        return round(2685.0 + random.uniform(-0.6, 0.6), 2)
+        if cls._last_valid_price is not None:
+            return cls._last_valid_price
+
+        raise RuntimeError(f"Tidak dapat mengambil harga awal untuk {target_pair}")
 
 
 class EMAMomentumStrategy:
-    def __init__(self, fast_period: int = 3, slow_period: int = 5, rsi_period: int = 14, atr_period: int = 14):
+    def __init__(self, fast_period: int = 5, slow_period: int = 13, rsi_period: int = 14, atr_period: int = 14):
         self.fast_period = fast_period
         self.slow_period = slow_period
         self.rsi_period = rsi_period
@@ -42,25 +64,49 @@ class EMAMomentumStrategy:
         self.prices = []
         self.highs = []
         self.lows = []
+        self._last_sample_ts = 0.0
+        self._bucket_high = 0.0
+        self._bucket_low = 0.0
 
-    def add_price(self, price: float):
+    def add_price(self, price: float, force_sample: bool = False) -> bool:
+        """Mengumpulkan high/low tiap detik dan mengunci penutupan sampel per 60 detik (1-menit candle)."""
+        if price <= 0:
+            return False
+
+        now = time.time()
+        if self._bucket_high == 0.0 or price > self._bucket_high:
+            self._bucket_high = price
+        if self._bucket_low == 0.0 or price < self._bucket_low:
+            self._bucket_low = price
+
+        # Rekam sampel baru jika dipaksa (saat startup) atau sudah lewat 60 detik
+        if not force_sample and (now - self._last_sample_ts) < 60.0 and len(self.prices) > 0:
+            return False
+
         self.prices.append(price)
-        # Estimasi high/low mikro proporsional (0.006% dari harga, cocok untuk IDR maupun USD)
-        spread = max(0.01, price * 0.00006)
-        self.highs.append(round(price + spread, 2))
-        self.lows.append(round(price - spread, 2))
+        spread = max(0.01, price * 0.0002)
+        self.highs.append(round(max(self._bucket_high, price + spread), 2))
+        self.lows.append(round(min(self._bucket_low, price - spread), 2))
 
-        if len(self.prices) > 60:
+        self._last_sample_ts = now
+        self._bucket_high = price
+        self._bucket_low = price
+
+        if len(self.prices) > 100:
             self.prices.pop(0)
             self.highs.pop(0)
             self.lows.pop(0)
+        return True
 
-    def calculate_ema(self, period: int) -> float:
-        if len(self.prices) < period:
-            return self.prices[-1]
+    def calculate_ema(self, period: int, price_series: list = None) -> float:
+        series = price_series if price_series is not None else self.prices
+        if not series:
+            return 0.0
+        if len(series) < period:
+            return series[-1]
         k = 2 / (period + 1)
-        ema = sum(self.prices[:period]) / period
-        for p in self.prices[period:]:
+        ema = sum(series[:period]) / period
+        for p in series[period:]:
             ema = (p * k) + (ema * (1 - k))
         return ema
 
@@ -86,15 +132,15 @@ class EMAMomentumStrategy:
         avg_loss = sum(recent_losses) / self.rsi_period
 
         if avg_loss == 0:
-            return 100.0
+            return 100.0 if avg_gain > 0 else 50.0
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
 
     def calculate_atr(self) -> float:
-        current_p = self.prices[-1] if self.prices else 2685.0
-        min_atr = current_p * 0.0006  # Minimal 0.06% dari harga aset
+        current_p = self.prices[-1] if self.prices else 71000000.0
+        min_atr = current_p * 0.001
         if len(self.prices) <= self.atr_period:
-            return round(current_p * 0.001, 2)
+            return round(current_p * 0.0015, 2)
 
         tr_list = []
         for i in range(1, len(self.prices)):
@@ -108,29 +154,37 @@ class EMAMomentumStrategy:
         return max(min_atr, sum(recent_tr) / len(recent_tr))
 
     def analyze(self, pair: str, current_price: float) -> dict:
-        self.add_price(current_price)
-        
-        if len(self.prices) < self.rsi_period + 2:
+        if not current_price or current_price <= 0:
+            return None
+
+        # Hanya evaluasi sinyal ketika candle 1-menit baru selesai terbentuk
+        is_new_candle = self.add_price(current_price, force_sample=False)
+        if not is_new_candle or len(self.prices) < self.rsi_period + 2:
             return None
 
         ema_fast = self.calculate_ema(self.fast_period)
         ema_slow = self.calculate_ema(self.slow_period)
+        prev_ema_fast = self.calculate_ema(self.fast_period, self.prices[:-1])
+        prev_ema_slow = self.calculate_ema(self.slow_period, self.prices[:-1])
+
         rsi = self.calculate_rsi()
         atr = self.calculate_atr()
 
-        ema_cross = (ema_fast > ema_slow) and (self.prices[-2] <= ema_slow)
-        rsi_valid = 42.0 <= rsi <= 68.0
+        # Syarat Crossover Valid: EMA Cepat memotong ke atas EMA Lambat + Harga naik nyata (> 0.05%)
+        ema_cross = (ema_fast > ema_slow) and (prev_ema_fast <= prev_ema_slow)
+        price_momentum = current_price > self.prices[-2] * 1.0005
+        rsi_valid = 48.0 <= rsi <= 65.0
 
-        if ema_cross and rsi_valid:
-            # Pastikan jarak TP menutup biaya transaksi exchange lokal (~0.3% - 0.5%)
-            min_tp_dist = current_price * 0.006
-            min_sl_dist = current_price * 0.004
+        if ema_cross and price_momentum and rsi_valid:
+            # Jarak TP minimal 1.0% dan SL minimal 0.6% (tahan terhadap spread & fee Indodax)
+            min_tp_dist = current_price * 0.010
+            min_sl_dist = current_price * 0.006
 
-            tp_distance = round(max(atr * 1.8, min_tp_dist), 2)
-            sl_distance = round(max(atr * 1.2, min_sl_dist), 2)
+            tp_distance = round(max(atr * 2.0, min_tp_dist), 2)
+            sl_distance = round(max(atr * 1.3, min_sl_dist), 2)
 
-            tp_price = round(current_price + tp_distance, 2)
-            sl_price = round(current_price - sl_distance, 2)
+            tp_price = round(current_price + tp_distance, 0 if "IDR" in pair.upper() else 2)
+            sl_price = round(current_price - sl_distance, 0 if "IDR" in pair.upper() else 2)
 
             return {
                 "pair": pair,

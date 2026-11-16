@@ -69,7 +69,7 @@ def sys_log(msg: str, level: str = "INFO", notify_telegram: bool = False):
 
 init_db()
 broker = get_broker_client()
-strategy = EMAMomentumStrategy(fast_period=3, slow_period=5, rsi_period=14, atr_period=14)
+strategy = EMAMomentumStrategy(fast_period=5, slow_period=13, rsi_period=14, atr_period=14)
 
 def check_risk_circuit_breaker() -> bool:
     today_pnl = get_today_realized_pnl()
@@ -310,7 +310,7 @@ def start_automated_loop():
     for i in range(15):
         try:
             price = MarketDataFeed.get_spot_price(pair)
-            strategy.add_price(price)
+            strategy.add_price(price, force_sample=True)
             last_known_price = price
             update_telemetry(pair, price)
         except Exception as e:
