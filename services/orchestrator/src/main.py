@@ -29,7 +29,7 @@ MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
 BREAKEVEN_THRESHOLD_PCT = 0.0012
 TRAILING_DISTANCE_PCT = 0.0008
 
-last_known_price = 72000000.0 if IS_IDR_PAIR else 2685.0
+last_known_price = 71000000.0 if IS_IDR_PAIR else 2685.0
 _last_error_alert_ts = 0.0
 
 try:
@@ -71,10 +71,7 @@ init_db()
 broker = get_broker_client()
 strategy = EMAMomentumStrategy(fast_period=5, slow_period=13, rsi_period=14, atr_period=14)
 
-def check_risk_circuit_breaker()
-        if "STOP_LOSS" in reason and res["pnl"] < 0:
-            r.setex("hermes:sl_cooldown", 1800, "active")
-            sys_log("COOLDOWN AKTIF: Jeda beli 30 menit pasca-Stop Loss untuk menghindari whipsaw.", "WARN") -> bool:
+def check_risk_circuit_breaker() -> bool:
     today_pnl = get_today_realized_pnl()
     if today_pnl <= DAILY_MAX_DRAWDOWN:
         sys_log(f"CIRCUIT BREAKER! Rugi harian ({today_pnl:,.2f}) menyentuh limit.", "WARN")
@@ -121,7 +118,10 @@ def close_single_position(pos: dict, current_price: float, reason: str = "MANUAL
         }
         r.publish("hermes:alerts", json.dumps(alert_payload))
         check_risk_circuit_breaker()
-        sys_log(f"Posisi {ticket} ditutup ({reason}) @ {current_price:,.0f} | PnL: {res['pnl']:,.0f}")
+        if "STOP_LOSS" in reason and res["pnl"] < 0:
+            r.setex("hermes:sl_cooldown", 1800, "active")
+            sys_log("COOLDOWN AKTIF: Jeda beli 30 menit pasca-Stop Loss untuk menghindari whipsaw.", "WARN")
+        sys_log(f"Posisi {ticket} ditutup ({reason}) @ {current_price:,.0f} | Net PnL: {res['pnl']:,.0f}")
     except Exception as e:
         sys_log(f"Gagal menutup posisi {ticket}: {e}", "ERROR", notify_telegram=True)
 
@@ -191,6 +191,7 @@ def process_trailing_and_exits(pair: str, current_price: float):
 def dispatch_trade_proposal(proposal: dict):
     if r.get("hermes:kill_switch") == "active":
         return
+
     ttl = r.ttl("hermes:sl_cooldown")
     if ttl and ttl > 0:
         sys_log(f"Sinyal BUY dilewati: Masih dalam masa Cooldown pasca-SL ({ttl // 60} menit tersisa).", "INFO")
@@ -308,7 +309,7 @@ def update_telemetry(pair: str, price: float):
 def start_automated_loop():
     global last_known_price
     pair = TRADING_SYMBOL
-    sys_log(f"Strategy Engine (EMA+RSI+ATR Guard) Aktif pada pair: {pair}")
+    sys_log(f"Strategy Engine (EMA 5/13 + RSI + Spread Guard) Aktif pada pair: {pair}")
 
     t_manual = threading.Thread(target=listen_manual_close_events, daemon=True)
     t_manual.start()
@@ -324,7 +325,7 @@ def start_automated_loop():
             sys_log(f"Gagal ambil sampel awal ke-{i+1}: {e}", "WARN")
         time.sleep(1)
 
-    sys_log(f"Monitoring pasar aktif! Harga terkini {pair}: Rp {last_known_price:,.0f}")
+    sys_log(f"Monitoring pasar aktif! Mid-Price terkini {pair}: Rp {last_known_price:,.0f}")
 
     tick_counter = 0
     while True:
@@ -357,7 +358,7 @@ def start_automated_loop():
                         dispatch_trade_proposal(proposal)
                         time.sleep(15)
             else:
-                strategy.add_price(current_price)
+                strategy.add_price(current_price, force_sample=False)
                 update_telemetry(pair, current_price)
 
             tick_counter += 1
@@ -365,7 +366,7 @@ def start_automated_loop():
                 ema_f = strategy.calculate_ema(strategy.fast_period)
                 ema_s = strategy.calculate_ema(strategy.slow_period)
                 rsi_v = strategy.calculate_rsi()
-                sys_log(f"Heartbeat OK | Harga: {current_price:,.0f} | EMA13: {ema_f:,.0f} | EMA13: {ema_s:,.0f} | RSI: {rsi_v:.1f}")
+                sys_log(f"Heartbeat OK | Harga: {current_price:,.0f} | EMA5: {ema_f:,.0f} | EMA13: {ema_s:,.0f} | RSI: {rsi_v:.1f}")
 
         except Exception as e:
             sys_log(f"Error pada loop utama: {e}", "ERROR", notify_telegram=True)

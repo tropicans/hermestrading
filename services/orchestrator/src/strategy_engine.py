@@ -20,7 +20,7 @@ class MarketDataFeed:
 
     @classmethod
     def get_spot_price(cls, pair: str = None) -> float:
-        """Mengambil harga pasar spot riil langsung dari Indodax API dengan caching aman."""
+        """Mengambil Mid-Price (rata-rata Bid & Ask aktif) dari Indodax agar harga selalu hidup."""
         target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
         exchange_id = os.getenv("EXCHANGE_ID", "indodax").lower()
 
@@ -38,7 +38,6 @@ class MarketDataFeed:
                         sell_ask = float(ticker.get("sell") or 0)
                         if buy_bid > 0 and sell_ask > 0:
                             cls._last_spread_pct = (sell_ask - buy_bid) / buy_bid
-                            # Gunakan mid-price orderbook aktif agar indikator tidak membeku saat last trade diam
                             cls._last_valid_price = round((buy_bid + sell_ask) / 2.0, 0)
                             return cls._last_valid_price
                         if last_price > 0:
@@ -50,9 +49,15 @@ class MarketDataFeed:
         try:
             ex = cls._get_public_exchange()
             ticker = ex.fetch_ticker(target_pair)
-            last_price = ticker.get("last") or ticker.get("close")
-            if last_price and float(last_price) > 0:
-                cls._last_valid_price = float(last_price)
+            buy_bid = float(ticker.get("bid") or 0)
+            sell_ask = float(ticker.get("ask") or 0)
+            last_price = float(ticker.get("last") or ticker.get("close") or 0)
+            if buy_bid > 0 and sell_ask > 0:
+                cls._last_spread_pct = (sell_ask - buy_bid) / buy_bid
+                cls._last_valid_price = round((buy_bid + sell_ask) / 2.0, 0)
+                return cls._last_valid_price
+            if last_price > 0:
+                cls._last_valid_price = last_price
                 return cls._last_valid_price
         except Exception as e:
             print(f"[strategy_engine] Peringatan: Gagal mengambil ticker {target_pair}: {e}")
@@ -77,7 +82,6 @@ class EMAMomentumStrategy:
         self._bucket_low = 0.0
 
     def add_price(self, price: float, force_sample: bool = False) -> bool:
-        """Mengumpulkan high/low tiap detik dan mengunci penutupan sampel per 60 detik (1-menit candle)."""
         if price <= 0:
             return False
 
@@ -87,7 +91,6 @@ class EMAMomentumStrategy:
         if self._bucket_low == 0.0 or price < self._bucket_low:
             self._bucket_low = price
 
-        # Rekam sampel baru jika dipaksa (saat startup) atau sudah lewat 60 detik
         if not force_sample and (now - self._last_sample_ts) < 60.0 and len(self.prices) > 0:
             return False
 
@@ -167,7 +170,6 @@ class EMAMomentumStrategy:
         if not current_price or current_price <= 0:
             return None
 
-        # Hanya evaluasi sinyal ketika candle 1-menit baru selesai terbentuk
         is_new_candle = self.add_price(current_price, force_sample=False)
         if not is_new_candle or len(self.prices) < self.rsi_period + 2:
             return None
@@ -180,7 +182,6 @@ class EMAMomentumStrategy:
         rsi = self.calculate_rsi()
         atr = self.calculate_atr()
 
-        # Syarat Crossover Valid: EMA Cepat memotong ke atas EMA Lambat + Harga naik nyata (> 0.05%)
         ema_cross = (ema_fast > ema_slow) and (prev_ema_fast <= prev_ema_slow)
         price_momentum = current_price > self.prices[-2]
         rsi_valid = 45.0 <= rsi <= 68.0
@@ -209,7 +210,6 @@ class EMAMomentumStrategy:
             }
 
         if ema_cross and price_momentum and rsi_valid and spread_valid:
-            # Jarak TP minimal 1.0% dan SL minimal 0.6% (tahan terhadap spread & fee Indodax)
             min_tp_dist = current_price * 0.010
             min_sl_dist = current_price * 0.006
 
