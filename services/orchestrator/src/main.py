@@ -292,6 +292,7 @@ def update_telemetry(pair: str, price: float):
         ema_s = strategy.calculate_ema(strategy.slow_period, live_price=price) if strategy.prices else price
         rsi_v = strategy.calculate_rsi(live_price=price) if strategy.prices else 50.0
         atr_v = strategy.calculate_atr() if strategy.prices else 0.0
+        fib_v = strategy.calculate_fib_pullback(live_price=price)
         now_wib = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S WIB")
         telemetry = {
             "pair": pair,
@@ -300,6 +301,10 @@ def update_telemetry(pair: str, price: float):
             "ema_slow": round(ema_s, 0 if IS_IDR_PAIR else 2),
             "rsi": round(rsi_v, 2),
             "atr": round(atr_v, 0 if IS_IDR_PAIR else 2),
+            "fib_retrace": fib_v.get("retrace_pct", 50.0),
+            "fib_zone": fib_v.get("zone_pos_pct", 50.0),
+            "swing_high": fib_v.get("swing_high", price),
+            "swing_low": fib_v.get("swing_low", price),
             "samples": len(strategy.prices),
             "updated_at": now_wib
         }
@@ -310,7 +315,7 @@ def update_telemetry(pair: str, price: float):
 def start_automated_loop():
     global last_known_price
     pair = TRADING_SYMBOL
-    sys_log(f"Strategy Engine (EMA 5/13 + RSI + Spread Guard) Aktif pada pair: {pair}")
+    sys_log(f"Strategy Engine (EMA 5/13 + RSI + Fib Pullback Guard) Aktif pada pair: {pair}")
 
     t_manual = threading.Thread(target=listen_manual_close_events, daemon=True)
     t_manual.start()

@@ -19,8 +19,8 @@ class MarketDataFeed:
         return cls._exchange
 
     @classmethod
-    def get_recent_candles(cls, pair: str = None, limit: int = 25) -> list:
-        """Mengambil riwayat candle 1-menit (TF 1m) langsung dari chart Indodax agar RSI/EMA langsung akurat saat startup."""
+    def get_recent_candles(cls, pair: str = None, limit: int = 35) -> list:
+        """Mengambil riwayat candle 1-menit (TF 1m) langsung dari chart Indodax."""
         target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
         base, quote = target_pair.upper().split("/") if "/" in target_pair else (target_pair[:-3].upper(), target_pair[-3:].upper())
         symbol = f"{base}{quote}"
@@ -72,11 +72,12 @@ class MarketDataFeed:
 
 
 class EMAMomentumStrategy:
-    def __init__(self, fast_period: int = 5, slow_period: int = 13, rsi_period: int = 14, atr_period: int = 14):
+    def __init__(self, fast_period: int = 5, slow_period: int = 13, rsi_period: int = 14, atr_period: int = 14, fib_lookback: int = 30):
         self.fast_period = fast_period
         self.slow_period = slow_period
         self.rsi_period = rsi_period
         self.atr_period = atr_period
+        self.fib_lookback = fib_lookback
         self.prices = []
         self.highs = []
         self.lows = []
@@ -147,7 +148,6 @@ class EMAMomentumStrategy:
         avg_gain = sum(recent_gains) / self.rsi_period
         avg_loss = sum(recent_losses) / self.rsi_period
 
-        # Tambahkan baseline volatilitas mikro (0.01% dari harga) agar RSI tidak ekstrem 0.0 atau 100.0 saat pasar sepi
         noise_floor = (series[-1] * 0.0001) / self.rsi_period
         avg_gain += noise_floor
         avg_loss += noise_floor
@@ -172,6 +172,49 @@ class EMAMomentumStrategy:
         recent_tr = tr_list[-self.atr_period:]
         return max(min_atr, sum(recent_tr) / len(recent_tr))
 
+    def calculate_fib_pullback(self, live_price: float = None) -> dict:
+        """
+        Menghitung posisi harga terhadap Swing High & Swing Low 30 menit terakhir:
+        - retracement_pct: seberapa dalam diskon dari puncak Swing High (0% = tepat di pucuk, 50% = tengah, 100% = dasar Swing Low).
+        - zone_pos_pct: posisi dari bawah (0% = dasar Swing Low, 100% = pucuk Swing High).
+        - is_valid: True jika harga tidak berada di pucuk ekstrem (zone_pos_pct <= 76.4% atau retracement >= 23.6%),
+                    atau jika rentang harga masih sempit/sideways (< 0.20%) sehingga aman untuk breakout awal.
+        """
+        curr = live_price if live_price else (self.prices[-1] if self.prices else 0.0)
+        if not self.prices or curr <= 0:
+            return {"swing_high": curr, "swing_low": curr, "retrace_pct": 50.0, "zone_pos_pct": 50.0, "is_valid": True}
+
+        window_highs = self.highs[-self.fib_lookback:] if self.highs else self.prices[-self.fib_lookback:]
+        window_lows = self.lows[-self.fib_lookback:] if self.lows else self.prices[-self.fib_lookback:]
+
+        swing_high = max(max(window_highs), curr)
+        swing_low = min(min(window_lows), curr)
+        swing_range = swing_high - swing_low
+
+        # Jika rentang ayunan 30 menit masih sempit (< 0.20% dari harga), anggap fase akumulasi/breakout awal (aman)
+        if swing_range <= (curr * 0.0020):
+            return {
+                "swing_high": round(swing_high, 0),
+                "swing_low": round(swing_low, 0),
+                "retrace_pct": 50.0,
+                "zone_pos_pct": 50.0,
+                "is_valid": True
+            }
+
+        retrace_pct = ((swing_high - curr) / swing_range) * 100.0
+        zone_pos_pct = ((curr - swing_low) / swing_range) * 100.0
+
+        # Valid jika sudah terdiskon minimal 23.6% dari Swing High (posisi <= 76.4% dari lembah ke pucuk)
+        is_valid = zone_pos_pct <= 76.4
+
+        return {
+            "swing_high": round(swing_high, 0),
+            "swing_low": round(swing_low, 0),
+            "retrace_pct": round(retrace_pct, 1),
+            "zone_pos_pct": round(zone_pos_pct, 1),
+            "is_valid": is_valid
+        }
+
     def analyze(self, pair: str, current_price: float) -> dict:
         if not current_price or current_price <= 0:
             return None
@@ -187,21 +230,25 @@ class EMAMomentumStrategy:
 
         rsi = self.calculate_rsi()
         atr = self.calculate_atr()
+        fib = self.calculate_fib_pullback(current_price)
 
         ema_cross = (ema_fast > ema_slow) and (prev_ema_fast <= prev_ema_slow)
         price_momentum = current_price > self.prices[-2]
         rsi_valid = 45.0 <= rsi <= 68.0
         spread_pct = MarketDataFeed._last_spread_pct
         spread_valid = spread_pct <= 0.0085
+        fib_valid = fib["is_valid"]
 
-        if ema_cross and not (price_momentum and rsi_valid and spread_valid):
+        if ema_cross and not (price_momentum and rsi_valid and spread_valid and fib_valid):
             reasons = []
             if not rsi_valid:
-                reasons.append(f"RSI {rsi:.1f} di luar zona aman (45-68)")
+                reasons.append(f"RSI {rsi:.1f} di luar zona (45-68)")
+            if not fib_valid:
+                reasons.append(f"Fib Guard: Harga di pucuk swing ({fib['zone_pos_pct']:.1f}% > 76.4%, diskon baru {fib['retrace_pct']:.1f}%)")
             if not price_momentum:
                 reasons.append("Harga belum konfirmasi naik dari menit lalu")
             if not spread_valid:
-                reasons.append(f"Spread Indodax terlalu lebar ({spread_pct*100:.2f}% > 0.85%)")
+                reasons.append(f"Spread terlalu lebar ({spread_pct*100:.2f}% > 0.85%)")
             return {
                 "action": "SKIPPED",
                 "pair": pair,
@@ -211,11 +258,13 @@ class EMAMomentumStrategy:
                     "rsi": round(rsi, 2),
                     "atr": round(atr, 2),
                     "ema_fast": round(ema_fast, 0 if "IDR" in pair.upper() else 2),
-                    "ema_slow": round(ema_slow, 0 if "IDR" in pair.upper() else 2)
+                    "ema_slow": round(ema_slow, 0 if "IDR" in pair.upper() else 2),
+                    "fib_retrace": fib["retrace_pct"],
+                    "fib_zone": fib["zone_pos_pct"]
                 }
             }
 
-        if ema_cross and price_momentum and rsi_valid and spread_valid:
+        if ema_cross and price_momentum and rsi_valid and spread_valid and fib_valid:
             min_tp_dist = current_price * 0.010
             min_sl_dist = current_price * 0.006
 
@@ -236,7 +285,9 @@ class EMAMomentumStrategy:
                     "rsi": round(rsi, 2),
                     "atr": round(atr, 2),
                     "ema_fast": round(ema_fast, 2),
-                    "ema_slow": round(ema_slow, 2)
+                    "ema_slow": round(ema_slow, 2),
+                    "fib_retrace": fib["retrace_pct"],
+                    "fib_zone": fib["zone_pos_pct"]
                 }
             }
         return None
