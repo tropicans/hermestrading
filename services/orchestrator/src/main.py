@@ -24,10 +24,10 @@ IS_IDR_PAIR = "IDR" in TRADING_SYMBOL
 MAX_CAPITAL_RISK_PER_TRADE = float(os.getenv("MAX_CAPITAL_RISK_PER_TRADE", "0.05"))
 DEFAULT_DRAWDOWN = "-2500000.0" if IS_IDR_PAIR else "-150.0"
 DAILY_MAX_DRAWDOWN = float(os.getenv("DAILY_MAX_DRAWDOWN", DEFAULT_DRAWDOWN))
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "3"))
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
 
-BREAKEVEN_THRESHOLD_PCT = 0.0012
-TRAILING_DISTANCE_PCT = 0.0008
+BREAKEVEN_THRESHOLD_PCT = 0.0065
+TRAILING_DISTANCE_PCT = 0.0018
 
 last_known_price = 71000000.0 if IS_IDR_PAIR else 2685.0
 _last_error_alert_ts = 0.0
@@ -121,6 +121,7 @@ def close_single_position(pos: dict, current_price: float, reason: str = "MANUAL
         if "STOP_LOSS" in reason and res["pnl"] < 0:
             r.setex("hermes:sl_cooldown", 1800, "active")
             sys_log("COOLDOWN AKTIF: Jeda beli 30 menit pasca-Stop Loss untuk menghindari whipsaw.", "WARN")
+        r.setex("hermes:sl_cooldown", 600 if res["pnl"] >= 0 else 1800, "active")
         sys_log(f"Posisi {ticket} ditutup ({reason}) @ {current_price:,.0f} | Net PnL: {res['pnl']:,.0f}")
     except Exception as e:
         sys_log(f"Gagal menutup posisi {ticket}: {e}", "ERROR", notify_telegram=True)
