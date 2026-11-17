@@ -195,7 +195,6 @@ def build_logs_and_telemetry_text():
                 f"• RSI (14): <code>{t.get('rsi')}</code> (Target Buy: 45 - 68)\n"
                 f"• ATR (14): <code>{fmt_curr(t.get('atr'))}</code>\n"
                 f"• Fib Swing (30m): <code>{fmt_curr(t.get('swing_low'))}</code> - <code>{fmt_curr(t.get('swing_high'))}</code> (Posisi: <code>{t.get('fib_zone', 50.0)}%</code> | Target &lt;= 76.4%)\n"
-                f"• Fib Swing (30m): <code>{fmt_curr(t.get('swing_low'))}</code> - <code>{fmt_curr(t.get('swing_high'))}</code> (Posisi: <code>{t.get('fib_zone', 50.0)}%</code> | Target &lt;= 76.4%)\n"
                 f"• Update Terakhir: <code>{t.get('updated_at')}</code>\n"
             )
         except Exception:
