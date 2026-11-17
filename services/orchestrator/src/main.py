@@ -118,10 +118,9 @@ def close_single_position(pos: dict, current_price: float, reason: str = "MANUAL
         }
         r.publish("hermes:alerts", json.dumps(alert_payload))
         check_risk_circuit_breaker()
-        if "STOP_LOSS" in reason and res["pnl"] < 0:
+        if reason == "STOP_LOSS_ATR":
             r.setex("hermes:sl_cooldown", 1800, "active")
-            sys_log("COOLDOWN AKTIF: Jeda beli 30 menit pasca-Stop Loss untuk menghindari whipsaw.", "WARN")
-        r.setex("hermes:sl_cooldown", 600 if res["pnl"] >= 0 else 1800, "active")
+            sys_log("COOLDOWN AKTIF: Jeda beli 30 menit pasca-Stop Loss murni untuk menghindari whipsaw.", "WARN")
         sys_log(f"Posisi {ticket} ditutup ({reason}) @ {current_price:,.0f} | Net PnL: {res['pnl']:,.0f}")
     except Exception as e:
         sys_log(f"Gagal menutup posisi {ticket}: {e}", "ERROR", notify_telegram=True)
@@ -187,6 +186,12 @@ def process_trailing_and_exits(pair: str, current_price: float):
             triggered = "TRAILING_STOP_LOSS" if sl >= buy_p else "STOP_LOSS_ATR"
 
         if triggered:
+            if "STOP_LOSS" in triggered:
+                sl_hits = int(r.get(f"hermes:sl_hits:{ticket}") or 0) + 1
+                r.setex(f"hermes:sl_hits:{ticket}", 15, str(sl_hits))
+                if sl_hits < 2:
+                    sys_log(f" Tahan SL #{ticket} (Tick 1/2 @ {current_price:,.0f} <= {sl:,.0f}) - verifikasi kedipan orderbook...", "INFO")
+                    continue
             close_single_position(pos, current_price, triggered)
 
 def dispatch_trade_proposal(proposal: dict):
