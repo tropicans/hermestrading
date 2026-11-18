@@ -30,6 +30,8 @@ def init_db():
             remaining_balance REAL,
             close_price REAL DEFAULT NULL,
             pnl REAL DEFAULT 0.0,
+            fill_fee REAL DEFAULT 0.0,
+            exit_reason TEXT DEFAULT NULL,
             status TEXT DEFAULT 'OPEN',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             closed_at TIMESTAMP DEFAULT NULL
@@ -57,6 +59,8 @@ def init_db():
         "highest_price": "REAL DEFAULT NULL",
         "close_price": "REAL DEFAULT NULL",
         "pnl": "REAL DEFAULT 0.0",
+        "fill_fee": "REAL DEFAULT 0.0",
+        "exit_reason": "TEXT DEFAULT NULL",
         "closed_at": "TIMESTAMP DEFAULT NULL"
     }
 
@@ -70,14 +74,14 @@ def init_db():
 
 def record_order(trade_id: str, ticket: str, pair: str, action: str, contract_type: str, 
                  volume: float, fill_price: float, total_cost: float, remaining_balance: float, 
-                 tp: float, sl: float, status: str = "OPEN"):
+                 tp: float, sl: float, status: str = "OPEN", fill_fee: float = 0.0):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         INSERT OR REPLACE INTO orders 
-        (trade_id, ticket, pair, action, contract_type, volume, fill_price, take_profit, stop_loss, highest_price, total_cost, remaining_balance, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (trade_id, ticket, pair, action, contract_type, volume, fill_price, tp, sl, fill_price, total_cost, remaining_balance, status))
+        (trade_id, ticket, pair, action, contract_type, volume, fill_price, take_profit, stop_loss, highest_price, total_cost, remaining_balance, fill_fee, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (trade_id, ticket, pair, action, contract_type, volume, fill_price, tp, sl, fill_price, total_cost, remaining_balance, fill_fee, status))
     conn.commit()
     conn.close()
 
@@ -101,16 +105,26 @@ def update_trailing_stop(ticket: str, new_sl: float, new_high: float):
     conn.commit()
     conn.close()
 
-def close_position_db(ticket: str, close_price: float, pnl: float, remaining_balance: float):
+def close_position_db(ticket: str, close_price: float, pnl: float, remaining_balance: float,
+                      exit_reason: str = None):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE orders 
-        SET status = 'CLOSED', close_price = ?, pnl = ?, remaining_balance = ?, closed_at = CURRENT_TIMESTAMP
+        SET status = 'CLOSED', close_price = ?, pnl = ?, remaining_balance = ?, exit_reason = ?, closed_at = CURRENT_TIMESTAMP
         WHERE ticket = ?
-    """, (close_price, pnl, remaining_balance, ticket))
+    """, (close_price, pnl, remaining_balance, exit_reason, ticket))
     conn.commit()
     conn.close()
+
+def get_order_by_ticket(ticket: str):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM orders WHERE ticket = ?", (ticket,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 def get_today_realized_pnl() -> float:
     conn = get_connection()

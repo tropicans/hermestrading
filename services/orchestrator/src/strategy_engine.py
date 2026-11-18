@@ -215,6 +215,47 @@ class EMAMomentumStrategy:
             "is_valid": is_valid
         }
 
+    def _cost_aware_levels(self, price: float, atr: float, pair: str) -> dict:
+        """Hitung TP/SL yang memperhitungkan biaya pulang-pergi exchange.
+
+        Rumus lama memakai floor konstan (TP min 1.0%, SL min 0.6%) sementara biaya
+        bolak-balik ~0.74% (pad 0.05% x2 + fee taker 0.22% x2). Hasilnya TP terbaik
+        hanya +0.26% net dan trailing eksit terbaik -0.27% net: mustahil profit.
+
+        Sekarang jarak minimum dinyatakan dalam "R" (kelipatan SL) sehingga ekspektasi
+        neto positif selama win rate di atas ~1/(1+RR).
+        """
+        round_nd = 0 if "IDR" in pair.upper() else 2
+
+        if "IDR" in pair.upper():
+            # Pair IDR: spread dan lot besar, butuh jarak lebih lebar.
+            atr_mult_sl = float(os.getenv("ATR_SL_MULT_IDR", "2.0"))
+            atr_mult_tp = float(os.getenv("ATR_TP_MULT_IDR", "4.0"))
+            rr_target = float(os.getenv("TP_RR_TARGET_IDR", "2.2"))
+            min_sl_pct = float(os.getenv("MIN_SL_PCT_IDR", "0.0090"))
+        else:
+            atr_mult_sl = float(os.getenv("ATR_SL_MULT", "1.5"))
+            atr_mult_tp = float(os.getenv("ATR_TP_MULT", "3.0"))
+            rr_target = float(os.getenv("TP_RR_TARGET", "2.0"))
+            min_sl_pct = float(os.getenv("MIN_SL_PCT", "0.0040"))
+
+        sl_distance = max(atr * atr_mult_sl, price * min_sl_pct)
+        # Net R:R = (TP_pct - c) / (SL_pct + c). Agar selalu sama dengan rr_target,
+        # TP harus = rr_target * (SL_pct + c) + c. Versi sebelumnya
+        # (TP = RR*SL + c) hanya memberi R:R neto ~1.2 saat SL di minimum.
+        roundtrip_cost = float(os.getenv("ROUNDTRIP_COST_PCT", "0.0074"))
+        cost_pct = min(roundtrip_cost, float(os.getenv("MAX_ROUNDTRIP_COST_PCT", "0.0200")))
+        net_sl_pct = (sl_distance / price) + cost_pct
+        tp_floor = price * ((rr_target * net_sl_pct) + cost_pct)
+        tp_distance = max(atr * atr_mult_tp, tp_floor)
+
+        return {
+            "tp_distance": round(tp_distance, 2),
+            "sl_distance": round(sl_distance, 2),
+            "tp_price": round(price + tp_distance, round_nd),
+            "sl_price": round(price - sl_distance, round_nd),
+        }
+
     def analyze(self, pair: str, current_price: float) -> dict:
         if not current_price or current_price <= 0:
             return None
@@ -236,7 +277,11 @@ class EMAMomentumStrategy:
         price_momentum = current_price > self.prices[-2]
         rsi_valid = 45.0 <= rsi <= 68.0
         spread_pct = MarketDataFeed._last_spread_pct
-        spread_valid = spread_pct <= 0.0085
+        # Limit order beli dipasang di best ask + SLIPPAGE_PAD_PCT. Jika spread lebih lebar
+        # dari MAX_SPREAD_PCT, harga limit terlalu jauh di bawah ask dan order menggantung
+        # (tidak terisi) padahal DB sudah mencatat posisi OPEN.
+        max_spread = float(os.getenv("MAX_SPREAD_PCT", "0.0035"))
+        spread_valid = 0 < spread_pct <= max_spread
         fib_valid = fib["is_valid"]
 
         if ema_cross and not (price_momentum and rsi_valid and spread_valid and fib_valid):
@@ -248,7 +293,7 @@ class EMAMomentumStrategy:
             if not price_momentum:
                 reasons.append("Harga belum konfirmasi naik dari menit lalu")
             if not spread_valid:
-                reasons.append(f"Spread terlalu lebar ({spread_pct*100:.2f}% > 0.85%)")
+                reasons.append(f"Spread terlalu lebar ({spread_pct*100:.2f}% > {max_spread*100:.2f}%)")
             return {
                 "action": "SKIPPED",
                 "pair": pair,
@@ -265,29 +310,43 @@ class EMAMomentumStrategy:
             }
 
         if ema_cross and price_momentum and rsi_valid and spread_valid and fib_valid:
-            min_tp_dist = current_price * 0.010
-            min_sl_dist = current_price * 0.006
+            levels = self._cost_aware_levels(current_price, atr, pair)
 
-            tp_distance = round(max(atr * 2.0, min_tp_dist), 2)
-            sl_distance = round(max(atr * 1.3, min_sl_dist), 2)
-
-            tp_price = round(current_price + tp_distance, 0 if "IDR" in pair.upper() else 2)
-            sl_price = round(current_price - sl_distance, 0 if "IDR" in pair.upper() else 2)
+            # Tolak sinyal bila jarak SL tidak cukup menutup biaya bolak-balik.
+            roundtrip_cost = float(os.getenv("ROUNDTRIP_COST_PCT", "0.0074"))
+            min_rr = float(os.getenv("MIN_NET_RR", "1.5"))
+            net_tp = (levels["tp_distance"] / current_price) - roundtrip_cost
+            net_sl = (levels["sl_distance"] / current_price) + roundtrip_cost
+            if net_tp <= 0 or (net_tp / net_sl) < min_rr:
+                return {
+                    "action": "SKIPPED",
+                    "pair": pair,
+                    "trigger_price": current_price,
+                    "reason": (f"R:R neto {net_tp/net_sl:.2f} < {min_rr} "
+                               f"(TP net {net_tp*100:.2f}%, SL net {net_sl*100:.2f}%)"),
+                    "meta": {
+                        "rsi": round(rsi, 2),
+                        "atr": round(atr, 2),
+                        "fib_retrace": fib["retrace_pct"],
+                        "fib_zone": fib["zone_pos_pct"]
+                    }
+                }
 
             return {
                 "pair": pair,
                 "action": "BUY",
                 "contract_type": "SPOT",
                 "trigger_price": current_price,
-                "take_profit": tp_price,
-                "stop_loss": sl_price,
+                "take_profit": levels["tp_price"],
+                "stop_loss": levels["sl_price"],
                 "meta": {
                     "rsi": round(rsi, 2),
                     "atr": round(atr, 2),
                     "ema_fast": round(ema_fast, 2),
                     "ema_slow": round(ema_slow, 2),
                     "fib_retrace": fib["retrace_pct"],
-                    "fib_zone": fib["zone_pos_pct"]
+                    "fib_zone": fib["zone_pos_pct"],
+                    "net_rr": round(net_tp / net_sl, 2)
                 }
             }
         return None
