@@ -1,5 +1,7 @@
 # Konfigurasi rahasia dan kredensial (JANGAN DI-PUSH)
 .env
+.env.*
+!.env.example
 
 # Database SQLite lokal dan data runtime
 *.db
