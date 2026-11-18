@@ -391,16 +391,17 @@ def start_automated_loop():
     t_manual = threading.Thread(target=listen_manual_close_events, daemon=True)
     t_manual.start()
 
-    sys_log(f"Mengumpulkan 15 sampel data harga awal {pair} dari {os.getenv('EXCHANGE_ID', 'indodax').upper()}...")
-    hist_candles = MarketDataFeed.get_recent_candles(pair, limit=20)
-    if len(hist_candles) >= 15:
-        for hc in hist_candles:
-            strategy.add_price(hc, force_sample=True)
+    sys_log(f"Mengumpulkan candle OHLC awal {pair} dari {os.getenv('EXCHANGE_ID', 'indodax').upper()}...")
+    hist_ohlc = MarketDataFeed.get_recent_candles_ohlc(pair, limit=60, timeframe_min=1)
+    if len(hist_ohlc) >= 20:
+        strategy.ingest_ohlc(hist_ohlc)
         price = MarketDataFeed.get_spot_price(pair)
         strategy.add_price(price, force_sample=True)
         last_known_price = price
         update_telemetry(pair, price)
+        sys_log(f"Seed dari {len(hist_ohlc)} candle OHLC (ATR & RSI berbasis candle asli).")
     else:
+        sys_log("Candle OHLC tidak tersedia; memakai sampel harga tunggal (ATR kurang akurat).", "WARN")
         for i in range(15):
             try:
                 price = MarketDataFeed.get_spot_price(pair)
