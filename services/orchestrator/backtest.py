@@ -119,18 +119,38 @@ class Result:
 
 def run_backtest(candles: List[dict], pair: str, *, cost_pct: float, capital: float,
                  use_trailing: bool, trailing_arm: float, trailing_gap: float,
-                 min_net_rr: float, max_spread: float) -> Result:
+                 min_net_rr: float, max_spread: float,
+                 strategy_name: str = "ema_crossover") -> Result:
     os.environ.setdefault("ROUNDTRIP_COST_PCT", str(cost_pct))
     os.environ.setdefault("MIN_NET_RR", str(min_net_rr))
     os.environ.setdefault("MAX_SPREAD_PCT", str(max_spread))
 
-    strategy = EMAMomentumStrategy(fast_period=5, slow_period=13, rsi_period=14, atr_period=14)
+    from strategies import STRATEGIES
+
     res = Result()
     open_trade: Optional[Trade] = None
-    # Biaya per leg dipakai saat entry; fee + slippage dihitung di akhir juga.
     fee_per_leg = cost_pct / 2.0
-    warmup = max(strategy.slow_period, strategy.rsi_period, strategy.atr_period) + 5
-    window = max(100, warmup + 40)
+
+    if strategy_name == "ema_crossover":
+        strategy = EMAMomentumStrategy(fast_period=5, slow_period=13, rsi_period=14, atr_period=14)
+        warmup = max(strategy.slow_period, strategy.rsi_period, strategy.atr_period) + 5
+        window = max(100, warmup + 40)
+    else:
+        if strategy_name not in STRATEGIES:
+            raise ValueError(f"Strategi tidak dikenal: {strategy_name}")
+        strategy = STRATEGIES[strategy_name](pair)
+        warmup = 205
+        window = 260
+
+    def get_signal(idx: int, window_candles: List[dict], price: float):
+        if strategy_name == "ema_crossover":
+            strategy.ingest_ohlc(window_candles)
+            strategy._last_sample_ts = 0.0
+            return strategy.evaluate_signal(pair, price, spread_pct=0.0005)
+        closes = [c["c"] for c in window_candles]
+        highs = [c["h"] for c in window_candles]
+        lows = [c["l"] for c in window_candles]
+        return strategy.signal(closes, highs, lows)
 
     for idx, candle in enumerate(candles):
         price = candle["c"]
@@ -148,7 +168,7 @@ def run_backtest(candles: List[dict], pair: str, *, cost_pct: float, capital: fl
                         tr.trailing_armed = True
 
             # --- urutan eksekusi dalam candle: SL lebih dulu (konservatif) ---
-            hit_sl = candle["l"] <= tr.sl
+            hit_sl = tr.sl > 0 and candle["l"] <= tr.sl
             hit_tp = candle["h"] >= tr.tp
 
             exit_price = None
@@ -169,15 +189,13 @@ def run_backtest(candles: List[dict], pair: str, *, cost_pct: float, capital: fl
                 open_trade = None
 
         # --- sinyal entry: hanya bila tidak ada posisi terbuka ---
-        # ATR dan Fib butuh candle nyata, jadi jendela digeser per bar.
+        # ATR, Fib, dan indikator butuh candle nyata, jadi jendela digeser per bar.
         if idx + 1 < warmup:
             continue
         window_candles = candles[max(0, idx + 1 - window): idx + 1]
-        strategy.ingest_ohlc(window_candles)
-        strategy._last_sample_ts = 0.0  # paksa sampel baru tiap bar backtest
 
         if open_trade is None:
-            proposal = strategy.evaluate_signal(pair, price, spread_pct=0.0005)
+            proposal = get_signal(idx, window_candles, price)
             if proposal:
                 res.signals += 1
                 if proposal.get("action") == "SKIPPED":
@@ -293,6 +311,10 @@ def main() -> int:
     ap.add_argument("--max-spread", type=float, default=0.0005,
                     help="spread yang diasumsikan saat backtest (fraksi harga)")
     ap.add_argument("--csv", help="simpan daftar trade ke file CSV")
+    ap.add_argument("--strategy", default="ema_crossover",
+                    choices=["ema_crossover", "mean_reversion", "donchian_breakout",
+                             "slow_trend", "buy_hold", "all"],
+                    help="strategi yang diuji (all = bandingkan semuanya)")
     ap.add_argument("--fetch-cache", metavar="PATH", nargs="?", const=DEFAULT_CACHE,
                     help="unduh candle lalu simpan ke JSON (untuk dipindah ke mesin lain)")
     ap.add_argument("--cache", metavar="PATH",
@@ -325,33 +347,86 @@ def main() -> int:
         print(f"[backtest] Tidak ada candle dalam {args.days} hari terakhir.")
         return 1
 
-    res = run_backtest(
-        candles, args.pair,
-        cost_pct=args.cost_pct,
-        capital=args.capital,
-        use_trailing=not args.no_trailing,
-        trailing_arm=args.trailing_arm,
-        trailing_gap=args.trailing_gap,
-        min_net_rr=args.min_net_rr,
-        max_spread=args.max_spread,
-    )
+    names = (["ema_crossover", "mean_reversion", "donchian_breakout", "slow_trend", "buy_hold"]
+             if args.strategy == "all" else [args.strategy])
 
-    stats = summarize(res)
-    by_reason = {}
-    for t in res.trades:
-        by_reason[t.exit_reason] = by_reason.get(t.exit_reason, 0) + 1
-    print_report(stats, by_reason, args.pair, args.days, args.tf)
+    results = []
+    for name in names:
+        res = run_backtest(
+            candles, args.pair,
+            cost_pct=args.cost_pct,
+            capital=args.capital,
+            use_trailing=not args.no_trailing,
+            trailing_arm=args.trailing_arm,
+            trailing_gap=args.trailing_gap,
+            min_net_rr=args.min_net_rr,
+            max_spread=args.max_spread,
+            strategy_name=name,
+        )
+        stats = summarize(res)
+        results.append((name, res, stats))
+
+        if args.strategy != "all":
+            by_reason = {}
+            for t in res.trades:
+                by_reason[t.exit_reason] = by_reason.get(t.exit_reason, 0) + 1
+            print(f"\n[backtest] Strategi: {name}")
+            print_report(stats, by_reason, args.pair, args.days, args.tf)
+
+    if args.strategy == "all":
+        print_comparison(results, args.pair, args.days, args.tf)
 
     if args.csv:
         import csv
+        name, _, _ = results[0]
         with open(args.csv, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
             w.writerow(["entry_ts", "entry_price", "tp", "sl", "exit_ts", "exit_price", "exit_reason", "pnl"])
-            for t in res.trades:
+            for t in results[0][1].trades:
                 w.writerow([t.entry_ts, t.entry_price, t.tp, t.sl, t.exit_ts, t.exit_price, t.exit_reason, round(t.pnl, 2)])
-        print(f"[backtest] Trade disimpan ke {args.csv}")
+        print(f"[backtest] Trade strategi {name} disimpan ke {args.csv}")
 
-    return 0 if stats["trades"] else 2
+    any_trades = any(r[2]["trades"] for r in results)
+    return 0 if any_trades else 2
+
+
+def print_comparison(results, pair: str, days: int, tf: int) -> None:
+    """Tabel pembanding semua strategi. Pemenang = expectancy tertinggi yang lolos breakeven."""
+    print()
+    print("=" * 88)
+    print(f"  PERBANDINGAN STRATEGI — {pair} | TF {tf}m | {days} hari")
+    print("=" * 88)
+    print(f"  {'Strategi':<18}{'Trade':>7}{'Win%':>8}{'BE%':>8}{'Expect':>12}{'Total PnL':>14}{'PF':>7}  Putusan")
+    print("-" * 88)
+    for name, _res, s in results:
+        if s["trades"] == 0:
+            print(f"  {name:<18}{0:>7}{'-':>8}{'-':>8}{'-':>12}{'-':>14}{'-':>7}  TIDAK ADA TRADE")
+            continue
+        pf = s["profit_factor"]
+        pf_str = f"{pf:.2f}" if pf != float("inf") else "inf"
+        if name == "buy_hold":
+            # Pembanding, bukan strategi trading: dinilai dari PnL total saja.
+            verdict = "BENCHMARK"
+            print(f"  {name:<18}{s['trades']:>7}{'-':>8}{'-':>8}{'-':>12}{s['total_pnl']:>14,.0f}{pf_str:>7}  {verdict}")
+            continue
+        verdict = "LOLOS" if s["win_rate"] > s["breakeven_wr"] and s["expectancy"] > 0 else "GAGAL"
+        print(f"  {name:<18}{s['trades']:>7}{s['win_rate']*100:>7.1f}%{s['breakeven_wr']*100:>7.1f}%"
+              f"{s['expectancy']:>12,.0f}{s['total_pnl']:>14,.0f}{pf_str:>7}  {verdict}")
+    print("=" * 88)
+
+    winners = [(n, s) for n, _r, s in results
+               if n != "buy_hold" and s["trades"] > 0 and s["expectancy"] > 0]
+    benchmark = next((s for n, _r, s in results if n == "buy_hold"), None)
+    if winners:
+        best = max(winners, key=lambda x: x[1]["expectancy"])
+        print(f"  TERBAIK: {best[0]} (expectancy Rp {best[1]['expectancy']:,.0f}/trade)")
+        if benchmark and best[1]["total_pnl"] <= benchmark["total_pnl"]:
+            print(f"  PERINGATAN: strategi terbaik masih kalah dari buy-and-hold "
+                  f"(Rp {benchmark['total_pnl']:,.0f}).")
+    else:
+        print("  Tidak ada strategi dengan expectancy positif. Jangan trading.")
+    print("=" * 88)
+    print()
 
 
 if __name__ == "__main__":
