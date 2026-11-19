@@ -107,26 +107,36 @@ class CCXTSpotBroker:
 
     # ---------- account ----------
 
+    @staticmethod
+    def _extract_free(balances: dict, currency: str) -> float:
+        curr_u = currency.upper()
+        curr_l = currency.lower()
+        # 1. Top-level dict: balances["IDR"] = {"free": ..., "used": ..., "total": ...}
+        val = balances.get(curr_u) or balances.get(curr_l)
+        if isinstance(val, dict):
+            return float(val.get("free") or 0.0)
+        if isinstance(val, (int, float, str)):
+            try:
+                return float(val)
+            except ValueError:
+                pass
+        # 2. Unified free dict: balances["free"]["IDR"]
+        free_map = balances.get("free")
+        if isinstance(free_map, dict) and (curr_u in free_map or curr_l in free_map):
+            return float(free_map.get(curr_u) or free_map.get(curr_l) or 0.0)
+        # 3. Raw Indodax payload: balances["info"]["return"]["balance"]["idr"]
+        raw_bal = (balances.get("info") or {}).get("return", {}).get("balance", {})
+        if isinstance(raw_bal, dict) and (curr_l in raw_bal or curr_u in raw_bal):
+            return float(raw_bal.get(curr_l) or raw_bal.get(curr_u) or 0.0)
+        return 0.0
+
     def get_account_balance(self, pair: str = None) -> dict:
-        target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
+        target_pair = pair or os.getenv("TRADING_SYMBOL", "BTC/IDR")
         base_curr, quote_curr = self._split_pair(target_pair)
         try:
             balances = self.client.fetch_balance()
-            cash_bal = float(balances.get(quote_curr, 0.0) or 0.0)
-            asset_bal = float(balances.get(base_curr, 0.0) or 0.0)
-
-            if cash_bal == 0.0 and asset_bal == 0.0:
-                # Beberapa versi ccxt tidak mengisi kunci mata uang di top-level.
-                # Bentuk yang benar: balances[currency] == {"free": ..., "used": ..., "total": ...}
-                for code, entry in balances.items():
-                    if not _is_indodax_currency(code, entry):
-                        continue
-                    free_amt = float(entry.get("free") or 0.0)
-                    if code.upper() == quote_curr:
-                        cash_bal = free_amt
-                    elif code.upper() == base_curr:
-                        asset_bal = free_amt
-
+            cash_bal = self._extract_free(balances, quote_curr)
+            asset_bal = self._extract_free(balances, base_curr)
             return {
                 "cash_balance": cash_bal,
                 "asset_balance": asset_bal

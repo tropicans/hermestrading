@@ -47,7 +47,7 @@ ADMIN_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
-TRADING_SYMBOL = os.getenv("TRADING_SYMBOL", "PAXG/IDR").upper()
+TRADING_SYMBOL = os.getenv("TRADING_SYMBOL", "BTC/IDR").upper()
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "indodax").upper()
 IS_IDR = "IDR" in TRADING_SYMBOL
 
@@ -171,7 +171,7 @@ def generate_performance_report(date_str="now"):
             f"• Perputaran Kas: <code>{fmt_curr(total_turnover)}</code>\n"
             f"• Realized PnL: {pnl_badge} <code>{pnl_prefix}{fmt_curr(abs(realized_pnl))}</code>\n"
             f"• Saldo Kas IDR: <code>{fmt_curr(latest_balance)}</code>\n"
-            f"• Saldo Aset PAXG: <code>{asset_balance:.6f} PAXG</code>\n"
+            f"• Saldo Aset {TRADING_SYMBOL.split('/')[0]}: <code>{asset_balance:.8f} {TRADING_SYMBOL.split('/')[0]}</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"Status Syariah: <code>STRICT (Spot 1:1, Zero-Swap)</code>"
         )
@@ -185,17 +185,20 @@ def build_logs_and_telemetry_text():
     if raw_tel:
         try:
             t = json.loads(raw_tel)
-            ema_diff = float(t.get("ema_fast", 0)) - float(t.get("ema_slow", 0))
-            trend_str = "BULLISH (EMA5 &gt; EMA13)" if ema_diff > 0 else "WAIT / CONSOLIDATION (EMA5 &lt;= EMA13)"
+            curr_p = float(t.get('price', 0) or 0)
+            ema50_v = float(t.get('ema_slow', 0) or 0)
+            l1_target = ema50_v * 0.955
+            dist_pct = ((curr_p - ema50_v) / ema50_v * 100.0) if ema50_v > 0 else 0.0
+            grid_status = 'ZONA BELI GRID (maks -4.5%)' if curr_p <= l1_target else f'STANDBY ({dist_pct:+.2f}% dari EMA50)'
             tel_block = (
-                f"• Harga Terkini: <code>{fmt_curr(t.get('price'))}</code>\n"
-                f"• EMA Cepat (5): <code>{fmt_curr(t.get('ema_fast'))}</code>\n"
-                f"• EMA Lambat (13): <code>{fmt_curr(t.get('ema_slow'))}</code>\n"
-                f"• Status EMA: <code>{trend_str}</code>\n"
-                f"• RSI (14): <code>{t.get('rsi')}</code> (Target Buy: 45 - 68)\n"
-                f"• ATR (14): <code>{fmt_curr(t.get('atr'))}</code>\n"
-                f"• Fib Swing (30m): <code>{fmt_curr(t.get('swing_low'))}</code> - <code>{fmt_curr(t.get('swing_high'))}</code> (Posisi: <code>{t.get('fib_zone', 50.0)}%</code> | Target &lt;= 76.4%)\n"
-                f"• Update Terakhir: <code>{t.get('updated_at')}</code>\n"
+                f'• Harga Terkini: <code>{fmt_curr(curr_p)}</code>\n'
+                f'• EMA 20 (1H): <code>{fmt_curr(t.get("ema_fast"))}</code>\n'
+                f'• EMA 50 (1H): <code>{fmt_curr(ema50_v)}</code>\n'
+                f'• Trigger Grid L1 (-4.5%): <code>{fmt_curr(l1_target)}</code>\n'
+                f'• Status Grid v3: <code>{grid_status}</code>\n'
+                f'• RSI (14): <code>{t.get("rsi")}</code> (Syarat L1: di bawah 35 | L2/L3: di bawah 33)\n'
+                f'• ATR (14): <code>{fmt_curr(t.get("atr"))}</code>\n'
+                f'• Update Terakhir: <code>{t.get("updated_at")}</code>\n'
             )
         except Exception:
             pass

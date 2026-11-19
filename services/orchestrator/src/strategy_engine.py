@@ -5,6 +5,21 @@ import urllib.request
 import json
 import ccxt
 
+
+def parse_timeframe_minutes(tf_str: str = None) -> int:
+    raw = (tf_str or os.getenv("TRADING_TIMEFRAME", "1h")).strip().lower()
+    if raw.endswith("m"):
+        return max(1, int(raw[:-1]))
+    if raw.endswith("h"):
+        return max(1, int(raw[:-1]) * 60)
+    if raw.endswith("d"):
+        return max(1, int(raw[:-1]) * 1440)
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 60
+
+
 class MarketDataFeed:
     _exchange = None
     _last_valid_price = None
@@ -19,18 +34,19 @@ class MarketDataFeed:
         return cls._exchange
 
     @classmethod
-    def get_recent_candles_ohlc(cls, pair: str = None, limit: int = 35, timeframe_min: int = 1) -> list:
-        """Ambil candle OHLC lengkap (bukan hanya close) untuk ATR dan RSI yang benar."""
-        target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
+    def get_recent_candles_ohlc(cls, pair: str = None, limit: int = 220, timeframe_min: int = None) -> list:
+        """Ambil candle OHLC resmi sesuai timeframe yang dikonfigurasi."""
+        target_pair = pair or os.getenv("TRADING_SYMBOL", "BTC/IDR")
+        tf_min = timeframe_min if timeframe_min is not None else parse_timeframe_minutes()
         base, quote = target_pair.upper().split("/") if "/" in target_pair else (target_pair[:-3].upper(), target_pair[-3:].upper())
         symbol = f"{base}{quote}"
         now_ts = int(time.time())
-        from_ts = now_ts - (limit * timeframe_min * 60 * 3)
+        from_ts = now_ts - (limit * tf_min * 60 * 2)
         try:
             url = (f"https://indodax.com/tradingview/history_v2?symbol={symbol}"
-                   f"&tf={timeframe_min}&from={from_ts}&to={now_ts}")
+                   f"&tf={tf_min}&from={from_ts}&to={now_ts}")
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=8) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
                 if not isinstance(data, list) or len(data) < 5:
                     return []
@@ -55,14 +71,13 @@ class MarketDataFeed:
         return []
 
     @classmethod
-    def get_recent_candles(cls, pair: str = None, limit: int = 35) -> list:
-        """Kompatibilitas: kembalikan hanya harga close dari candle OHLC."""
+    def get_recent_candles(cls, pair: str = None, limit: int = 220) -> list:
         return [c["c"] for c in cls.get_recent_candles_ohlc(pair, limit)]
 
     @classmethod
     def get_spot_price(cls, pair: str = None) -> float:
-        """Mengambil Mid-Price (rata-rata Bid & Ask aktif) dari Indodax agar harga selalu hidup."""
-        target_pair = pair or os.getenv("TRADING_SYMBOL", "PAXG/IDR")
+        """Mengambil Mid-Price (rata-rata Bid & Ask aktif) dari Indodax."""
+        target_pair = pair or os.getenv("TRADING_SYMBOL", "BTC/IDR")
         exchange_id = os.getenv("EXCHANGE_ID", "indodax").lower()
 
         if exchange_id == "indodax":
@@ -94,12 +109,23 @@ class MarketDataFeed:
 
 
 class EMAMomentumStrategy:
-    def __init__(self, fast_period: int = 5, slow_period: int = 13, rsi_period: int = 14, atr_period: int = 14, fib_lookback: int = 30):
+    """
+    HERMES v3 Wide-Swing 3-Layer Spot Grid (Syariah 1:1):
+    Akumulasi bertingkat 3 lapis (-4.5% / -5.18% / -5.85%) saat RSI jenuh jual + konfirmasi candle hijau,
+    dengan exit terpadu pada +4.2% dari Weighted Average Cost.
+    """
+    def __init__(self, fast_period: int = 20, slow_period: int = 50, trend_period: int = 200,
+                 rsi_period: int = 14, atr_period: int = 14, fib_lookback: int = 30,
+                 timeframe_min: int = None):
         self.fast_period = fast_period
         self.slow_period = slow_period
+        self.trend_period = trend_period
         self.rsi_period = rsi_period
         self.atr_period = atr_period
         self.fib_lookback = fib_lookback
+        self.timeframe_min = timeframe_min if timeframe_min is not None else parse_timeframe_minutes()
+        self.candle_interval_sec = float(self.timeframe_min * 60)
+        self.opens = []
         self.prices = []
         self.highs = []
         self.lows = []
@@ -108,22 +134,21 @@ class EMAMomentumStrategy:
         self._bucket_low = 0.0
         self.candle_ts = []
 
+        self.step_pct = float(os.getenv("GRID_STEP_PCT", "0.045"))
+        self.tp_pct = float(os.getenv("GRID_TP_PCT", "0.042"))
+        self.max_layers = int(os.getenv("GRID_MAX_LAYERS", "3"))
+        self.layer_weights = [0.25, 0.30, 0.35]
+
     def _update_candle_aggregates(self, price: float) -> None:
-        """Perbarui bucket high/low untuk candle menit berjalan (dipakai bila tidak ada OHLC eksternal)."""
         if self._bucket_high == 0.0 or price > self._bucket_high:
             self._bucket_high = price
         if self._bucket_low == 0.0 or price < self._bucket_low:
             self._bucket_low = price
 
     def ingest_ohlc(self, candles: list) -> None:
-        """Isi deret harga dari candle OHLC asli exchange.
-
-        Ini memberi ATR dan RSI dasar yang benar. Versi lama membangun high/low
-        sintetis dari `price +/- 0.02%`, sehingga ATR selalu mentok di `min_atr`
-        dan tidak pernah mengukur volatilitas nyata.
-        """
         if not candles:
             return
+        self.opens = [c["o"] for c in candles]
         self.prices = [c["c"] for c in candles]
         self.highs = [c["h"] for c in candles]
         self.lows = [c["l"] for c in candles]
@@ -139,9 +164,11 @@ class EMAMomentumStrategy:
         now = time.time()
         self._update_candle_aggregates(price)
 
-        if not force_sample and (now - self._last_sample_ts) < 60.0 and len(self.prices) > 0:
+        if not force_sample and (now - self._last_sample_ts) < self.candle_interval_sec and len(self.prices) > 0:
             return False
 
+        prev_close = self.prices[-1] if self.prices else price
+        self.opens.append(prev_close)
         self.prices.append(price)
         spread = max(0.01, price * 0.0002)
         self.highs.append(round(max(self._bucket_high, price + spread), 2))
@@ -151,7 +178,8 @@ class EMAMomentumStrategy:
         self._bucket_high = price
         self._bucket_low = price
 
-        if len(self.prices) > 100:
+        if len(self.prices) > 300:
+            self.opens.pop(0)
             self.prices.pop(0)
             self.highs.pop(0)
             self.lows.pop(0)
@@ -163,7 +191,7 @@ class EMAMomentumStrategy:
         if not series:
             return 0.0
         if len(series) < period:
-            return series[-1]
+            return sum(series) / len(series)
         k = 2 / (period + 1)
         ema = sum(series[:period]) / period
         for p in series[period:]:
@@ -178,7 +206,7 @@ class EMAMomentumStrategy:
         gains = []
         losses = []
         for i in range(1, len(series)):
-            change = series[i] - series[i-1]
+            change = series[i] - series[i - 1]
             if change > 0:
                 gains.append(change)
                 losses.append(0.0)
@@ -192,8 +220,6 @@ class EMAMomentumStrategy:
         avg_gain = sum(recent_gains) / self.rsi_period
         avg_loss = sum(recent_losses) / self.rsi_period
 
-        # Tanpa noise floor: menambah nilai sama ke gain dan loss memaksa RSI ke 50
-        # di pasar datar dan mencegah RSI mencapai ekstrem (dulu muncul RSI 97.4).
         if avg_loss == 0:
             return 100.0 if avg_gain > 0 else 50.0
         if avg_gain == 0:
@@ -203,228 +229,142 @@ class EMAMomentumStrategy:
         return 100.0 - (100.0 / (1.0 + rs))
 
     def calculate_atr(self) -> float:
-        """ATR dari true range candle asli.
-
-        `min_atr` hanya dipakai sebagai pengaman saat data tidak cukup, bukan sebagai
-        lantai tetap. Lantai 0.1% membuat ATR selalu mentok di angka minimum.
-        """
-        current_p = self.prices[-1] if self.prices else 71000000.0
+        current_p = self.prices[-1] if self.prices else 1500000000.0
         if len(self.prices) <= self.atr_period:
-            return round(current_p * 0.0015, 2)
+            return round(current_p * 0.005, 2)
 
         tr_list = []
         for i in range(1, len(self.prices)):
             hl = self.highs[i] - self.lows[i]
-            hc = abs(self.highs[i] - self.prices[i-1])
-            lc = abs(self.lows[i] - self.prices[i-1])
-            tr = max(hl, hc, lc)
-            tr_list.append(tr)
+            hc = abs(self.highs[i] - self.prices[i - 1])
+            lc = abs(self.lows[i] - self.prices[i - 1])
+            tr_list.append(max(hl, hc, lc))
 
         recent_tr = tr_list[-self.atr_period:]
         atr = sum(recent_tr) / len(recent_tr)
-        # Pengaman sanitas: ATR tidak boleh nol atau negatif.
-        return max(current_p * 0.00005, round(atr, 2))
+        return max(current_p * 0.0005, round(atr, 2))
 
     def calculate_fib_pullback(self, live_price: float = None) -> dict:
-        """
-        Menghitung posisi harga terhadap Swing High & Swing Low 30 menit terakhir:
-        - retracement_pct: seberapa dalam diskon dari puncak Swing High (0% = tepat di pucuk, 50% = tengah, 100% = dasar Swing Low).
-        - zone_pos_pct: posisi dari bawah (0% = dasar Swing Low, 100% = pucuk Swing High).
-        - is_valid: True jika harga tidak berada di pucuk ekstrem (zone_pos_pct <= 76.4% atau retracement >= 23.6%),
-                    atau jika rentang harga masih sempit/sideways (< 0.20%) sehingga aman untuk breakout awal.
-        """
         curr = live_price if live_price else (self.prices[-1] if self.prices else 0.0)
         if not self.prices or curr <= 0:
             return {"swing_high": curr, "swing_low": curr, "retrace_pct": 50.0, "zone_pos_pct": 50.0, "is_valid": True}
 
         window_highs = self.highs[-self.fib_lookback:] if self.highs else self.prices[-self.fib_lookback:]
         window_lows = self.lows[-self.fib_lookback:] if self.lows else self.prices[-self.fib_lookback:]
-
         swing_high = max(max(window_highs), curr)
         swing_low = min(min(window_lows), curr)
         swing_range = swing_high - swing_low
-
-        uptrend = False
-        if len(self.prices) >= self.slow_period:
-            uptrend = self.calculate_ema(self.fast_period) > self.calculate_ema(self.slow_period)
-        # Saat tren naik, membeli di dekat puncak swing adalah perilaku yang wajar;
-        # guard Fib dirancang untuk mencegah beli di puncak saat pasar sideways.
-        # Default 100 = guard nonaktif saat uptrend, tetap 76.4% saat bukan uptrend.
-        threshold = float(os.getenv("FIB_MAX_ZONE_TREND", "100.0")) if uptrend \
-            else float(os.getenv("FIB_MAX_ZONE_RANGE", "76.4"))
-
-        # Jika rentang ayunan 30 menit masih sempit (< 0.20% dari harga), anggap fase akumulasi/breakout awal (aman)
-        if swing_range <= (curr * 0.0020):
-            return {
-                "swing_high": round(swing_high, 0),
-                "swing_low": round(swing_low, 0),
-                "retrace_pct": 50.0,
-                "zone_pos_pct": 50.0,
-                "threshold_pct": threshold,
-                "uptrend": uptrend,
-                "is_valid": True
-            }
+        if swing_range <= (curr * 0.0030):
+            return {"swing_high": round(swing_high, 0), "swing_low": round(swing_low, 0), "retrace_pct": 50.0, "zone_pos_pct": 50.0, "is_valid": True}
 
         retrace_pct = ((swing_high - curr) / swing_range) * 100.0
-        # Di-clamp 0-100: swing_high memakai high candle, sedangkan curr biasanya close,
-        # sehingga zona mentah bisa melewati 100% dan membuat ambang 100 tidak pernah lolos.
         zone_pos_pct = max(0.0, min(100.0, ((curr - swing_low) / swing_range) * 100.0))
-
-        is_valid = zone_pos_pct <= threshold
-
         return {
             "swing_high": round(swing_high, 0),
             "swing_low": round(swing_low, 0),
             "retrace_pct": round(retrace_pct, 1),
             "zone_pos_pct": round(zone_pos_pct, 1),
-            "threshold_pct": threshold,
-            "uptrend": uptrend,
-            "is_valid": is_valid
+            "is_valid": True
         }
 
-    def _cost_aware_levels(self, price: float, atr: float, pair: str) -> dict:
-        """Hitung TP/SL yang memperhitungkan biaya pulang-pergi exchange.
-
-        Rumus lama memakai floor konstan (TP min 1.0%, SL min 0.6%) sementara biaya
-        bolak-balik ~0.74% (pad 0.05% x2 + fee taker 0.22% x2). Hasilnya TP terbaik
-        hanya +0.26% net dan trailing eksit terbaik -0.27% net: mustahil profit.
-
-        Sekarang jarak minimum dinyatakan dalam "R" (kelipatan SL) sehingga ekspektasi
-        neto positif selama win rate di atas ~1/(1+RR).
-        """
-        round_nd = 0 if "IDR" in pair.upper() else 2
-
-        if "IDR" in pair.upper():
-            # Pair IDR: spread dan lot besar, butuh jarak lebih lebar.
-            atr_mult_sl = float(os.getenv("ATR_SL_MULT_IDR", "2.0"))
-            atr_mult_tp = float(os.getenv("ATR_TP_MULT_IDR", "4.0"))
-            rr_target = float(os.getenv("TP_RR_TARGET_IDR", "2.2"))
-            min_sl_pct = float(os.getenv("MIN_SL_PCT_IDR", "0.0090"))
-        else:
-            atr_mult_sl = float(os.getenv("ATR_SL_MULT", "1.5"))
-            atr_mult_tp = float(os.getenv("ATR_TP_MULT", "3.0"))
-            rr_target = float(os.getenv("TP_RR_TARGET", "2.0"))
-            min_sl_pct = float(os.getenv("MIN_SL_PCT", "0.0040"))
-
-        sl_distance = max(atr * atr_mult_sl, price * min_sl_pct)
-        # Net R:R = (TP_pct - c) / (SL_pct + c). Agar selalu sama dengan rr_target,
-        # TP harus = rr_target * (SL_pct + c) + c. Versi sebelumnya
-        # (TP = RR*SL + c) hanya memberi R:R neto ~1.2 saat SL di minimum.
-        roundtrip_cost = float(os.getenv("ROUNDTRIP_COST_PCT", "0.0074"))
-        cost_pct = min(roundtrip_cost, float(os.getenv("MAX_ROUNDTRIP_COST_PCT", "0.0200")))
-        net_sl_pct = (sl_distance / price) + cost_pct
-        tp_floor = price * ((rr_target * net_sl_pct) + cost_pct)
-        tp_distance = max(atr * atr_mult_tp, tp_floor)
-
-        return {
-            "tp_distance": round(tp_distance, 2),
-            "sl_distance": round(sl_distance, 2),
-            "tp_price": round(price + tp_distance, round_nd),
-            "sl_price": round(price - sl_distance, round_nd),
-        }
-
-    def evaluate_signal(self, pair: str, current_price: float, atr: float = None,
+    def evaluate_signal(self, pair: str, current_price: float, open_positions: list = None,
                         spread_pct: float = None) -> dict:
-        """Inti logika sinyal, dipisah dari state sampling agar bisa dipakai backtester.
+        if not current_price or current_price <= 0 or len(self.prices) < self.slow_period:
+            return None
 
-        `analyze()` memanggil ini setelah menambah sampel harga. Backtester memanggilnya
-        langsung dengan deret harga yang sudah diisi, sehingga aturan entry yang diuji
-        persis sama dengan yang berjalan di produksi.
-        """
-        if not current_price or current_price <= 0 or len(self.prices) < self.rsi_period + 2:
+        positions = [p for p in (open_positions or []) if p.get("pair") == pair]
+        layer_idx = len(positions)
+        if layer_idx >= self.max_layers:
             return None
 
         ema_fast = self.calculate_ema(self.fast_period)
         ema_slow = self.calculate_ema(self.slow_period)
-        prev_ema_fast = self.calculate_ema(self.fast_period, self.prices[:-1])
-        prev_ema_slow = self.calculate_ema(self.slow_period, self.prices[:-1])
-
         rsi = self.calculate_rsi()
-        atr = self.calculate_atr() if atr is None else atr
-        fib = self.calculate_fib_pullback(current_price)
+        atr = self.calculate_atr()
+        round_nd = 0 if "IDR" in pair.upper() else 2
 
-        ema_cross = (ema_fast > ema_slow) and (prev_ema_fast <= prev_ema_slow)
-        price_momentum = len(self.prices) >= 2 and current_price > self.prices[-2]
-        rsi_valid = 45.0 <= rsi <= 68.0
+        last_open = self.opens[-1] if self.opens else current_price
+        last_close = self.prices[-1]
+        is_green_candle = last_close > last_open
+
         if spread_pct is None:
             spread_pct = MarketDataFeed._last_spread_pct
-        max_spread = float(os.getenv("MAX_SPREAD_PCT", "0.0035"))
-        spread_valid = 0 < spread_pct <= max_spread
-        fib_valid = fib["is_valid"]
+        max_spread = float(os.getenv("MAX_SPREAD_PCT", "0.0040"))
+        spread_valid = 0 <= spread_pct <= max_spread
 
-        if ema_cross and not (price_momentum and rsi_valid and spread_valid and fib_valid):
+        if layer_idx == 0:
+            target_entry = ema_slow * (1.0 - self.step_pct)
+            rsi_limit = 35.0
+            in_zone = last_close <= target_entry
+        else:
+            sorted_pos = sorted(positions, key=lambda x: float(x.get("fill_price", 0)))
+            lowest_entry = float(sorted_pos[0].get("fill_price", current_price))
+            required_drop = self.step_pct * (1.0 + 0.15 * layer_idx)
+            target_entry = lowest_entry * (1.0 - required_drop)
+            rsi_limit = 33.0
+            in_zone = last_close <= target_entry
+
+        rsi_valid = rsi < rsi_limit
+
+        if in_zone and not (is_green_candle and rsi_valid and spread_valid):
             reasons = []
+            if not is_green_candle:
+                reasons.append("Menunggu penutupan candle hijau konfirmasi pantulan")
             if not rsi_valid:
-                reasons.append(f"RSI {rsi:.1f} di luar zona (45-68)")
-            if not fib_valid:
-                reasons.append(f"Fib Guard: Harga di pucuk swing ({fib['zone_pos_pct']:.1f}% > {fib.get('threshold_pct', 76.4):.1f}%, diskon baru {fib['retrace_pct']:.1f}%)")
-            if not price_momentum:
-                reasons.append("Harga belum konfirmasi naik dari menit lalu")
+                reasons.append(f"RSI {rsi:.1f} >= {rsi_limit:.0f}")
             if not spread_valid:
-                reasons.append(f"Spread terlalu lebar ({spread_pct*100:.2f}% > {max_spread*100:.2f}%)")
+                reasons.append(f"Spread lebar ({spread_pct*100:.2f}%)")
             return {
                 "action": "SKIPPED",
                 "pair": pair,
                 "trigger_price": current_price,
-                "reason": ", ".join(reasons),
+                "reason": f"[Grid L{layer_idx+1}] " + ", ".join(reasons),
                 "meta": {
                     "rsi": round(rsi, 2),
                     "atr": round(atr, 2),
-                    "ema_fast": round(ema_fast, 0 if "IDR" in pair.upper() else 2),
-                    "ema_slow": round(ema_slow, 0 if "IDR" in pair.upper() else 2),
-                    "fib_retrace": fib["retrace_pct"],
-                    "fib_zone": fib["zone_pos_pct"]
+                    "ema_fast": round(ema_fast, round_nd),
+                    "ema_slow": round(ema_slow, round_nd),
+                    "layer": layer_idx + 1,
+                    "target_entry": round(target_entry, round_nd)
                 }
             }
 
-        if not (ema_cross and price_momentum and rsi_valid and spread_valid and fib_valid):
+        if not (in_zone and is_green_candle and rsi_valid and spread_valid):
             return None
 
-        levels = self._cost_aware_levels(current_price, atr, pair)
-
+        weight = self.layer_weights[min(layer_idx, len(self.layer_weights) - 1)]
+        tp_price = round(current_price * (1.0 + self.tp_pct), round_nd)
+        # Spot Syariah 1:1 Wide-Swing Grid tidak memakai SL ketat; proteksi bencana ekstrem -35%
+        sl_price = round(current_price * 0.65, round_nd)
         roundtrip_cost = float(os.getenv("ROUNDTRIP_COST_PCT", "0.0074"))
-        min_rr = float(os.getenv("MIN_NET_RR", "1.5"))
-        net_tp = (levels["tp_distance"] / current_price) - roundtrip_cost
-        net_sl = (levels["sl_distance"] / current_price) + roundtrip_cost
-        if net_tp <= 0 or (net_tp / net_sl) < min_rr:
-            return {
-                "action": "SKIPPED",
-                "pair": pair,
-                "trigger_price": current_price,
-                "reason": (f"R:R neto {net_tp/net_sl:.2f} < {min_rr} "
-                           f"(TP net {net_tp*100:.2f}%, SL net {net_sl*100:.2f}%)"),
-                "meta": {
-                    "rsi": round(rsi, 2),
-                    "atr": round(atr, 2),
-                    "fib_retrace": fib["retrace_pct"],
-                    "fib_zone": fib["zone_pos_pct"]
-                }
-            }
+        net_tp_pct = self.tp_pct - roundtrip_cost
 
         return {
             "pair": pair,
             "action": "BUY",
             "contract_type": "SPOT",
             "trigger_price": current_price,
-            "take_profit": levels["tp_price"],
-            "stop_loss": levels["sl_price"],
+            "take_profit": tp_price,
+            "stop_loss": sl_price,
+            "layer_weight": weight,
+            "layer_num": layer_idx + 1,
             "meta": {
                 "rsi": round(rsi, 2),
                 "atr": round(atr, 2),
-                "ema_fast": round(ema_fast, 2),
-                "ema_slow": round(ema_slow, 2),
-                "fib_retrace": fib["retrace_pct"],
-                "fib_zone": fib["zone_pos_pct"],
-                "net_rr": round(net_tp / net_sl, 2)
+                "ema_fast": round(ema_fast, round_nd),
+                "ema_slow": round(ema_slow, round_nd),
+                "layer": layer_idx + 1,
+                "layer_weight": weight,
+                "net_rr": round(net_tp_pct / 0.015, 2)
             }
         }
 
-    def analyze(self, pair: str, current_price: float) -> dict:
+    def analyze(self, pair: str, current_price: float, open_positions: list = None) -> dict:
         if not current_price or current_price <= 0:
             return None
 
         is_new_candle = self.add_price(current_price, force_sample=False)
-        if not is_new_candle or len(self.prices) < self.rsi_period + 2:
+        if not is_new_candle or len(self.prices) < self.slow_period:
             return None
 
-        return self.evaluate_signal(pair, current_price)
+        return self.evaluate_signal(pair, current_price, open_positions=open_positions)
