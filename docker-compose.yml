@@ -4,8 +4,6 @@ services:
     container_name: hermes_redis
     restart: always
     command: ["redis-server", "--appendonly", "yes"]
-    ports:
-      - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
