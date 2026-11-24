@@ -29,7 +29,10 @@ class SyariahGuard:
         allowed_pairs = [
             "EURUSD", "GBPUSD", "USDJPY", "XAUUSD",
             "PAXGUSDT", "PAXG/USDT", "PAXGUSD", "PAXG/USD",
-            "PAXGIDR", "PAXG/IDR", "BTCUSDT", "BTC/USDT", "BTCIDR", "BTC/IDR", "USDT/IDR", "USDTIDR"
+            "PAXGIDR", "PAXG/IDR", "BTCUSDT", "BTC/USDT", "BTCIDR", "BTC/IDR",
+            "SOLUSDT", "SOL/USDT", "SOLIDR", "SOL/IDR",
+            "ETHUSDT", "ETH/USDT", "ETHIDR", "ETH/IDR",
+            "USDT/IDR", "USDTIDR"
         ]
         if asset_pair not in allowed_pairs:
             raise SyariahComplianceError(f"Pelanggaran Syariah: Pair '{asset_pair}' tidak masuk daftar underlying spot terverifikasi.")
